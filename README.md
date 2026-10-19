@@ -1,0 +1,1 @@
+# poolsafe_integracao
