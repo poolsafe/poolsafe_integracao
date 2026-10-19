@@ -4,12 +4,11 @@ Este pacote executa o lado Python: vídeo/câmera -> YOLO11 -> ByteTrack -> conf
 
 ## 1. Comece por aqui
 
-1. Extraia o ZIP no computador ou servidor do colega responsável pelo Docker.
-2. Leia este README e `CONTRATO_N8N.md`.
-3. Envie o seu **best.pt treinado** ao host Docker. Não é necessário treinar dentro do contêiner.
-4. Comece com vídeo, TEST_MODE=true e PUBLISH_RABBIT=false.
-5. Depois habilite publicação em exchange/filas exclusivas de teste e configure o consumidor n8n.
-6. Só depois teste câmera, heartbeat, reconexão e notificação real.
+1. Leia este README e `CONTRATO_N8N.md`.
+2. Envie o seu **best.pt treinado** ao host Docker. Não é necessário treinar dentro do contêiner.
+3. Comece com vídeo, TEST_MODE=true e PUBLISH_RABBIT=false.
+4. Depois habilite publicação em exchange/filas exclusivas de teste e configure o consumidor n8n.
+5. Só depois teste câmera, heartbeat, reconexão e notificação real.
 
 Os padrões de oito frames, confiança 0,25, 15 frames normais e cooldown de três segundos são parâmetros experimentais, não limites de qualidade comprovados. Não reduzem automaticamente os falsos positivos. O contador usa frames PROCESSADOS consecutivos com o mesmo ID, não todos os frames capturados, e interrompe a sequência ao perder detecção, receber normal ou exceder MAX_INTERVALO_S.
 
