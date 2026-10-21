@@ -97,10 +97,12 @@ jobs:
           cache-to: type=gha,mode=min
 
       - name: Verificar instalação e importação das dependências dentro da imagem
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           # Executa sem GPU, sem pesos, sem acesso aos serviços e sem iniciar main.py.
           # Execução isolada sem rede (--network none) para validar instalação e importação.
-          FIRST_TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -n 1)
+          FIRST_TAG=$(echo "$TAGS" | head -n 1)
           docker run --rm --network none "$FIRST_TAG" python -c "
           import cv2
           import pika
@@ -111,16 +113,20 @@ jobs:
           "
 
       - name: Publicar imagem verificada no GHCR
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           # Publica o artefato exato previamente verificado (sem reconstruir)
-          for tag in ${{ steps.meta.outputs.tags }}; do
+          for tag in $TAGS; do
             echo "Publicando tag: $tag"
             docker push "$tag"
           done
 
       - name: Registrar digest e resumo da execução
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          PRIMARY_TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -n 1)
+          PRIMARY_TAG=$(echo "$TAGS" | head -n 1)
           DIGEST=$(docker inspect --format='{{range .RepoDigests}}{{.}}{{"\n"}}{{end}}' "$PRIMARY_TAG" | head -n 1)
 
           if [ -z "$DIGEST" ]; then
@@ -133,6 +139,6 @@ jobs:
           echo "- **Revisão:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Digest publicado:** \`${DIGEST}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Tags publicadas:**" >> $GITHUB_STEP_SUMMARY
-          for tag in ${{ steps.meta.outputs.tags }}; do
+          for tag in $TAGS; do
             echo "  - \`$tag\`" >> $GITHUB_STEP_SUMMARY
           done
