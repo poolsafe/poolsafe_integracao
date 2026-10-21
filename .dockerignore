@@ -1,0 +1,49 @@
+# Metadados Git, CI e ferramentas de assistência
+.git/
+.github/
+.agents/
+
+# Documentação de repositório e contratos (não necessários no container)
+README.md
+CONTRATO_N8N.md
+docs/
+
+# Caches e arquivos compilados Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.cache/
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+
+# Arquivos de ambiente e segredos locais
+.env*
+*.pem
+*.key
+*.crt
+
+# Testes automatizados (já executados e validados no job de validação)
+tests/
+
+# Pesos do modelo, vídeos e dados operacionais (montados externamente via volumes)
+*.pt
+*.onnx
+*.engine
+*.mp4
+*.avi
+*.mkv
+*.mov
+modelos/
+entrada/
+dados/
+runs/
+
+# Arquivos de banco local SQLite e logs
+*.sqlite*
+*.db*
+*.log

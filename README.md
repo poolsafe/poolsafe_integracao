@@ -1,230 +1,219 @@
-# PoolSafe - produtor Python de integração 2.0.0
+# PoolSafe — Produtor Python de Integração (Worker de Visão Computacional)
 
-Este pacote executa o lado Python: vídeo/câmera -> YOLO11 -> ByteTrack -> confirmação temporal -> RabbitMQ. O n8n, a API Node.js, o MySQL, o FCM e o aplicativo continuam sendo componentes externos. Não é uma implantação completa desses serviços nem uma validação do modelo.
+Este pacote executa o worker de visão computacional da solução PoolSafe: captura de vídeo/câmera -> inferência YOLO11 -> rastreamento ByteTrack -> confirmação temporal de queda -> outbox SQLite local -> mensageria RabbitMQ.
 
-## 1. Comece por aqui
+O n8n, a API Node.js, o banco MySQL, as notificações push FCM e o aplicativo móvel são serviços externos. O worker não administra filas, usuários, autorizações ou regras de negócio da API.
 
-1. Leia este README e `CONTRATO_N8N.md`.
-2. Envie o seu **best.pt treinado** ao host Docker. Não é necessário treinar dentro do contêiner.
-3. Comece com vídeo, TEST_MODE=true e PUBLISH_RABBIT=false.
-4. Depois habilite publicação em exchange/filas exclusivas de teste e configure o consumidor n8n.
-5. Só depois teste câmera, heartbeat, reconexão e notificação real.
+---
 
-Os padrões de oito frames, confiança 0,25, 15 frames normais e cooldown de três segundos são parâmetros experimentais, não limites de qualidade comprovados. Não reduzem automaticamente os falsos positivos. O contador usa frames PROCESSADOS consecutivos com o mesmo ID, não todos os frames capturados, e interrompe a sequência ao perder detecção, receber normal ou exceder MAX_INTERVALO_S.
+## 1. Fluxo de Entrega e CI/CD
 
-## 2. Arquivos e responsabilidades
-
-| Arquivo | Função |
-|---|---|
-| main.py | Carrega best.pt, roda YOLO/ByteTrack, gera eventos e coordena encerramento |
-| config.py | Lê e valida variáveis de ambiente |
-| captura.py | Recebe stream, mantém somente o frame mais recente e reconecta |
-| regras.py | Confirma sequências, encerra episódios e aplica cooldown |
-| transporte.py | Outbox SQLite e publicação RabbitMQ em thread separada |
-| Dockerfile | Constrói a imagem contendo todo o código e as bibliotecas |
-| compose.yaml | Modelo de Stack para Portainer/Docker Compose |
-| requirements.txt | Dependências fixadas para o perfil de implantação |
-| CONTRATO_N8N.md | Payload e obrigações propostas ao consumidor |
-| tests/test_core.py e test_pipeline.py | Verificação da lógica e persistência sem serviços reais |
-
-**main.py depende dos outros quatro módulos Python. Não copie apenas esse arquivo.** O Dockerfile copia todos automaticamente. Os comentários explicam decisões e limitações no próprio código.
-
-## 3. Preparar o host e os arquivos
-
-Exemplo de pastas no SERVIDOR onde Docker executa:
+O repositório adota o mesmo padrão da API PoolSafe:
 
 ```text
-/opt/poolsafe/worker/          código extraído do ZIP
-/opt/poolsafe/modelos/best.pt  seu modelo treinado
-/opt/poolsafe/entrada/teste.mp4
-/opt/poolsafe/dados/camera_teste_01/
+Git push (main) 
+  -> GitHub Actions valida (Python 3.11, compilação, testes unitários, docker compose config)
+  -> Constrói imagem Docker (linux/amd64)
+  -> Executa verificação de importação das bibliotecas (torch, torchvision, cv2, ultralytics, pika)
+  -> Publica imagem no GitHub Container Registry (GHCR) privado
+  -> Implantação manual controlada via Portainer (Stack Git ou Compose)
 ```
 
-Use SFTP/WinSCP ou o mecanismo já adotado pela equipe para enviar arquivos. O Web editor do Portainer NÃO envia o best.pt ou os módulos Python ao host.
+### Imagem e Tags Publicadas
 
-No host, com permissões administrativas para preparar as pastas:
+- **Referência Canônica da Imagem:** `ghcr.io/poolsafe/poolsafe_integracao` *(o namespace do GHCR deve ser sempre em letras minúsculas)*.
+- **Tags Geradas:**
+  - `main`: reflete o commit mais recente integrado na branch principal;
+  - `sha-<SHA_40_DIGITOS>`: tag imutável do commit exato (ex.: `sha-c1a2b3...`).
+- **Digest e Rastreabilidade:** O digest exato da imagem publicada (`sha256:...`) e os metadados OCI (repositório e revisão) são registrados no **Summary** da execução do GitHub Actions (`$GITHUB_STEP_SUMMARY`) e nos detalhes do pacote no GitHub Packages.
 
-```bash
-sudo mkdir -p /opt/poolsafe/modelos /opt/poolsafe/entrada /opt/poolsafe/dados/camera_teste_01
-sudo chown -R 10001:10001 /opt/poolsafe/dados/camera_teste_01
-```
+---
 
-O contêiner usa UID/GID 10001. O modelo e o vídeo precisam ser legíveis por esse usuário. Montagens de modelo e entrada são somente leitura; não use chmod 777.
+## 2. Separação Estrita: Código e Modelo (Pesos Independentes)
 
-Dentro do contêiner:
+A imagem Docker empacota exclusivamente o código Python e suas dependências de runtime. Os pesos do modelo (`best.pt`), os vídeos de ensaio e os dados de persistência **ficam fora da imagem**, montados a partir do host da VPS.
 
-- modelo: `/modelos/best.pt`;
-- vídeo: `/entrada/teste.mp4`;
-- dados graváveis: `/dados`.
-
-Não colocar modelos, vídeos ou credenciais na imagem. Nunca carregar arquivos .pt de origem não confiável.
-
-## 4. Construir a imagem e configurar a rede
-
-Na pasta que contém o Dockerfile:
-
-```bash
-cd /opt/poolsafe/worker
-docker build -t poolsafe-worker:2.0.0 .
-```
-
-O build baixa dependências; precisa de acesso aos repositórios de pacotes. A imagem inclui Torch e pode ocupar vários GB. A versão Torch do contêiner difere do ambiente Colab: o carregamento do best real precisa ser testado. Não foi feito build nem teste GPU no ambiente de criação deste pacote.
-
-No Portainer, configure a rede externa oficial `poolsafe-network`. O worker e RabbitMQ compartilham essa rede:
-
-- DOCKER_NETWORK: `poolsafe-network`;
-- RABBIT_HOST: `rabbitmq` (alias do serviço na rede);
-- Vhost: `poolsafe`.
-
-A Stack não cria nem altera o RabbitMQ existente. O usuário produtor `poolsafe_python` possui permissões estritas para publicar na exchange `poolsafe.events` (`direct`, durável). O produtor **não declara** exchanges, filas ou bindings e não administra DLQ.
-
-## 5. Primeiro ensaio sem publicar
-
-Portainer -> Stacks -> Add stack. Cole `compose.yaml`, configure HOST_MODEL_DIR, HOST_VIDEO_DIR e HOST_DATA_DIR conforme o host. Defina:
+### Estrutura de Pastas Recomendada no Host (VPS)
 
 ```text
+/opt/poolsafe/
+├── modelos/
+│   └── releases/
+│       ├── modelo-001/
+│       │   └── best.pt          # Pesos da versão 001
+│       └── modelo-002/
+│           └── best.pt          # Nova versão de pesos
+├── entrada/
+│   └── teste.mp4                # Vídeo de ensaio local
+└── dados/
+    ├── ensaio-modelo-001/       # Persistência isolada do ensaio 001
+    └── ensaio-modelo-002/       # Persistência isolada do ensaio 002
+```
+
+### Regras de Governança dos Pesos
+
+1. **Pastas distintas por versão:** Cada release de pesos deve residir em sua própria pasta (`/opt/poolsafe/modelos/releases/<versao>/best.pt`).
+2. **Imutabilidade em execução:** Nunca sobrescreva o arquivo `best.pt` enquanto o container estiver rodando.
+3. **Identificação por SHA-256:** Na inicialização, o worker calcula e registra nos logs o SHA-256 exato do arquivo carregado e confere as classes esperadas (`pessoa_normal`, `pessoa_queda`).
+4. **Sem necessidade de rebuild:** A troca de pesos compatíveis com as mesmas classes não exige rebuild da imagem Docker — basta alterar a variável `HOST_MODEL_DIR` e o `MODEL_VERSION` no Compose.
+5. **Ensaios simultâneos:** Devem utilizar diretórios de dados (`HOST_DATA_DIR`) separados para evitar conflito de locks e concorrência no SQLite (`outbox.sqlite3`).
+6. **Recriação obrigatória:** Um simples *restart* do container não aplica novas variáveis de ambiente ou montagens de volume; é necessário recriar o container (no Portainer: *Update the stack* com *Re-pull image* ou recriação do container).
+7. **Rollback:** Para reverter um modelo ou versão de código com problemas, altere `WORKER_IMAGE`, `HOST_MODEL_DIR` e `MODEL_VERSION` de volta para a combinação estável anterior homologada.
+
+---
+
+## 3. Implantação no Portainer (Manual)
+
+### 3.1. Requisitos Prévios no Portainer / Host
+
+1. **Rede Docker Compartilhada:** Certifique-se de que a rede bridge externa `poolsafe-network` existe na VPS. Se necessário, crie-a com `docker network create poolsafe-network`.
+2. **Permissões de Pastas no Host:**
+   O container executa como usuário não privilegiado `UID:GID 10001`. A pasta de dados gravável precisa ter a titularidade correta:
+   ```bash
+   sudo mkdir -p /opt/poolsafe/modelos/releases/modelo-001 /opt/poolsafe/entrada /opt/poolsafe/dados/ensaio-modelo-001
+   sudo chown -R 10001:10001 /opt/poolsafe/dados/ensaio-modelo-001
+   # As pastas de modelo e entrada são montadas como somente leitura (:ro)
+   sudo chmod -R 755 /opt/poolsafe/modelos /opt/poolsafe/entrada
+   ```
+
+### 3.2. Acesso ao GHCR Privado vs. Acesso ao Repositório Git
+
+> [!IMPORTANT]
+> **Acesso ao repositório Git e acesso ao registry Docker são responsabilidades distintas no Portainer:**
+> - **Git Repository Credential:** Usada pelo Portainer para ler o `compose.yaml` do repositório Git (Personal Access Token ou Deploy Key com permissão de leitura de código `repo` / `contents:read`).
+> - **Registry Credential:** Usada pelo Docker Engine para puxar (`docker pull`) a imagem do GHCR. No Portainer, configure em **Settings -> Registries -> Add registry -> Custom**:
+>   - **Name:** `GHCR PoolSafe`
+>   - **Registry URL:** `ghcr.io`
+>   - **Authentication:** ativada, com seu usuário do GitHub e um PAT (Personal Access Token) contendo o escopo `read:packages`.
+> 
+> *Nota sobre visibilidade e permissões:* Após o primeiro push da imagem pelo GitHub Actions, acesse **GitHub -> Perfil/Organização -> Packages -> poolsafe_integracao** para verificar a visibilidade (privada) e conceder acesso de leitura (`Read`) ao token ou equipe responsável.
+
+### 3.3. Configuração da Stack no Portainer
+
+1. Acesse o Portainer -> **Stacks** -> **Add stack**.
+2. Selecione o método de implantação preferido:
+   - **Repository (Recomendado):**
+     - **Repository URL:** `https://github.com/poolsafe/poolsafe_integracao.git`
+     - **Repository reference:** `refs/heads/main`
+     - **Compose path:** `compose.yaml`
+     - **Authentication:** Habilite e preencha as credenciais Git.
+   - **Web editor:** Cole diretamente o conteúdo de [compose.yaml](file:///c:/Users/Daniel/Documents/Github-Poolsafe-TCC/poolsafe_integracao/compose.yaml).
+3. Na seção **Environment variables**, configure as variáveis baseando-se no arquivo [.env.example](file:///c:/Users/Daniel/Documents/Github-Poolsafe-TCC/poolsafe_integracao/.env.example).
+4. Para o **primeiro ensaio**, defina a imagem com tag por commit:
+   ```env
+   WORKER_IMAGE=ghcr.io/poolsafe/poolsafe_integracao:sha-<SHA_DO_COMMIT>
+   ```
+
+---
+
+## 4. Primeiro Ensaio com Vídeo (Sem Publicação)
+
+O primeiro ensaio deve validar o pipeline de visão computacional em ambiente real sem emitir mensagens ao RabbitMQ nem acionar alertas ao aplicativo móvel.
+
+### Configuração do Ensaio Seguro
+
+Defina as variáveis na Stack do Portainer:
+
+```env
+WORKER_IMAGE=ghcr.io/poolsafe/poolsafe_integracao:main
+CAMERA_ID=camera_teste_01
 SOURCE_MODE=video
 SOURCE=/entrada/teste.mp4
-MODEL_VERSION=candidato
-CAMERA_ID=camera_teste_01
+HOST_MODEL_DIR=/opt/poolsafe/modelos/releases/modelo-001
+HOST_VIDEO_DIR=/opt/poolsafe/entrada
+HOST_DATA_DIR=/opt/poolsafe/dados/ensaio-modelo-001
+MODEL_VERSION=modelo-001
+DEVICE=cpu
 TEST_MODE=true
 ALLOW_TEST_PUBLISH=false
 PUBLISH_RABBIT=false
-DEVICE=cpu
+INCLUDE_EVIDENCE=false
 ```
 
-Clique em Deploy the stack. Abra Containers -> worker -> Logs. O serviço deve registrar hash/classes do modelo, eventos locais e encerramento do arquivo. Não há janela gráfica no contêiner nem MP4 anotado gerado por este pacote. O `MODEL_VERSION=candidato` reflete uma versão claramente provisória até identificarmos e atestarmos o modelo real.
+### O que Conferir nos Logs do Container
 
-Os eventos sem publicação aparecem no log; não entram na outbox. O arquivo `/dados/deteccoes.jsonl` contém detecções por frame processado, incluindo frames vazios e detecções sem ID. Logs do Docker utilizam rotação (`max-size: 10m`, `max-file: 3`). A evidência não é escrita nos logs.
+Acesse **Containers -> poolsafe-worker -> Logs** e verifique:
 
-O vídeo é processado no ritmo nominal quando há capacidade; se a inferência for mais lenta, a execução fica mais lenta. Não pula frames de arquivo para compensar atraso. O timestamp `video_time_s` representa posição nominal do arquivo. Não mede latência câmera -> aplicativo. O EOF e uma falha de decodificação podem produzir término semelhante: conferir duração/contagem esperada em ensaio real.
+1. **Carregamento do modelo:** Verifique a emissão da linha de log contendo:
+   - `versão=<MODEL_VERSION>`
+   - `sha256=<HASH_SHA256>`
+   - `classes={0: 'pessoa_normal', 1: 'pessoa_queda'}`
+   - `device=cpu`
+2. **Modo e parâmetros operacionais:**
+   - `Modo=video teste=True publicação=False; frames=8 cooldown=3.0s`
+3. **Ausência de publicação e heartbeat:**
+   - Em `SOURCE_MODE=video`, o heartbeat de câmera fica completamente desativado.
+   - Nenhuma conexão AMQP é aberta quando `PUBLISH_RABBIT=false`.
+4. **Detecções e confirmações:**
+   - Eventos locais registrados no log e detalhados em `/dados/deteccoes.jsonl`.
+   - Tempo de processamento por frame e consumo de CPU/memória no container.
+   - Encerramento limpo ao atingir o fim do arquivo de vídeo.
 
-## 6. Publicar no RabbitMQ
+> [!NOTE]
+> Este worker não gera arquivos MP4 com caixas anotadas nem salva evidências gráficas no ensaio local se a publicação estiver desligada. Toda auditoria de inferência no ensaio é realizada via logs e pelo arquivo JSONL de detecções.
 
-Depois de validar o modelo localmente, definir na Stack:
+---
 
-```text
+## 5. Habilitando Publicação no RabbitMQ e Câmera ao Vivo
+
+### 5.1. Publicação de Teste no RabbitMQ
+
+Após homologar o ensaio sem publicação:
+
+```env
 PUBLISH_RABBIT=true
 ALLOW_TEST_PUBLISH=true
-CODIGO_INTEGRACAO=codigo_cadastrado_na_api
+CODIGO_INTEGRACAO=codigo_da_camera_na_api
 RABBIT_HOST=rabbitmq
 RABBIT_PORT=5672
-RABBIT_USER=poolsafe_python
-RABBIT_PASSWORD=senha_configurada_no_ambiente
 RABBIT_VHOST=poolsafe
+RABBIT_USER=poolsafe_python
+RABBIT_PASSWORD=senha_do_rabbit
 RABBIT_EXCHANGE=poolsafe.events
-RABBIT_ALERT_KEY=risk.detected
-RABBIT_HEARTBEAT_KEY=camera.heartbeat
-ALERT_TTL_S=0
 ```
 
-Não publicar esses valores reais no Git ou em prints. Para publicar em modo de teste (`TEST_MODE=true`), a flag `ALLOW_TEST_PUBLISH=true` é estritamente obrigatória, garantindo que o operador configurou destinos e câmeras de teste controlados.
+### 5.2. Câmera ao Vivo (RTSP) e Heartbeat
 
-O produtor publica alertas com persistência (`delivery_mode=2`), confirmação (`confirm_delivery`) e `mandatory=True`. Uma confirmação do broker não confirma persistência no domínio nem push no telefone. Se n8n estiver parado e a fila existir, o broker pode aceitar a mensagem normalmente.
-
-## 7. Câmera real e heartbeat
-
-Depois do ensaio de vídeo:
-
-```text
+```env
 SOURCE_MODE=stream
-SOURCE=URL_PRIVADA_RTSP_OU_HTTP_MJPEG
-TEST_MODE=true
-ALLOW_TEST_PUBLISH=true
-CAMERA_ID=identificador_operacional
-CODIGO_INTEGRACAO=codigo_cadastrado_na_API
+SOURCE=rtsp://usuario:senha@ip_camera:554/stream1
+CAMERA_ID=piscina_area_lazer
+CODIGO_INTEGRACAO=codigo_cadastrado_na_api
 ```
 
-SOURCE aceita uma URL de stream, não a página de login/interface da câmera. A URL e credenciais devem ficar no ambiente privado. Validar o acesso a partir do contêiner.
+- Em modo `stream`, o heartbeat de conectividade da câmera é emitido periodicamente (a cada ~30s com TTL de 60s) a partir da decodificação confirmada de frames reais.
+- O restart na Stack pode ser alterado para `unless-stopped` após validação da estabilidade do fluxo RTSP.
 
-Na Stack, trocar restart para `unless-stopped` somente após testes. A captura usa FFmpeg/OpenCV com timeouts de cinco segundos e reconexão em três segundos. A thread de captura mantém um slot para inferência: frames antigos no Python são substituídos.
+---
 
-O heartbeat é desacoplado da inferência: é gerado por callback a partir da decodificação confirmada de frames reais pelo leitor de stream, aproximadamente a cada 30 segundos, com validade de 60 segundos. Ele confirma captura ativa recente, não funcionamento da inferência ou do aplicativo. Não é emitido em modo vídeo nem na ausência de novos frames decodificados. Apenas o heartbeat mais recente fica retido em memória. A API adota janela de 90 segundos para determinar perda de comunicação.
+## 6. Arquivos e Responsabilidades do Módulo
 
-Ao reconectar, o tracker e o motor reiniciam. Um novo ID/segmento pode originar novo alerta da mesma situação: deduplicação semântica entre reconexões não está resolvida.
+| Arquivo | Função |
+|---|---|
+| `main.py` | Carrega modelo, executa rastreamento YOLO/ByteTrack, gerencia ciclo de vida e encerramento |
+| `config.py` | Validação estrita de tipos e regras das variáveis de ambiente |
+| `captura.py` | Gerenciamento de conexão RTSP com reconexão contínua e desacoplamento de frames |
+| `regras.py` | Motor de confirmação temporal de quedas (frames consecutivos, quebra por tempo, cooldown) |
+| `transporte.py` | Fila local outbox em SQLite e publicação persistente (`publisher confirms`) no RabbitMQ |
+| `Dockerfile` | Definição da imagem de runtime em Python 3.11 com usuário não-root (UID 10001) |
+| `compose.yaml` | Stack única para implantação no Portainer/Docker Compose |
+| `.env.example` | Template de configuração com valores seguros para ensaios |
+| `CONTRATO_N8N.md` | Especificação dos payloads de risco e heartbeat para os consumidores |
+| `tests/` | Suíte de testes unitários isolados (sem necessidade de GPU, câmera ou broker) |
 
-## 8. Pausa e controle do monitoramento
+---
 
-O Python NÃO consulta se o monitoramento está pausado. A captura, a inferência e a publicação continuam de forma autônoma.
+## 7. Testes e Validação Local
 
-A API é a autoridade de negócio:
-- Exige exatamente uma sessão de monitoramento `ATIVO` vinculada à câmera para criar alerta e notificar;
-- Sem monitoramento ativo, a API não cria alerta nem envia FCM e registra ocorrência operacional;
-- Se a API retornar HTTP `409` com código `ACTIVE_MONITORING_NOT_FOUND`, o consumidor n8n deve tratar como recusa de negócio legítima e **não deve retentar em loop** até uma suposta retomada;
-- Não há armazenamento local de detecções garantido durante a pausa.
-
-## 9. GPU e múltiplas câmeras
-
-O exemplo funciona por padrão em CPU. Para NVIDIA, o host deve ter driver e NVIDIA Container Toolkit funcionais. Descomente a reserva de dispositivo no compose e defina DEVICE=0. Comente a reserva novamente para CPU.
-
-Para várias câmeras, replique o serviço com CAMERA_ID, CODIGO_INTEGRACAO, SOURCE e HOST_DATA_DIR exclusivos. Cada processo carrega seus pesos e possui tracker/outbox próprios; não compartilhe SQLite entre processos. As filas são compartilhadas na infraestrutura oficial.
-
-## 10. Parâmetros e Limitações Confirmadas
-
-| Variável | Padrão | Significado |
-|---|---|---|
-| FRAMES_PARA_ALERTA | 8 | Frames processados consecutivos de queda com mesmo ID |
-| CONF | 0.25 | Limiar da inferência, não precisão global |
-| IOU | 0.70 | Parâmetro da supressão de caixas, não IoU de avaliação |
-| FRAMES_NORMAIS_ENCERRAR | 15 | Normais consecutivos para rearmar o mesmo ID |
-| COOLDOWN_S | 3 | Intervalo mínimo global por câmera entre emissões |
-| MAX_INTERVALO_S | 0.5 | Máxima lacuna temporal entre frames consecutivos |
-| LOST_RESET_S | 2 | Tempo sem ID para descartar estado |
-| ALERT_TTL_S | 0 | Validade do alerta em segundos (0 = sem expiração automática no produtor) |
-| ALLOW_TEST_PUBLISH | false | Liberação explícita para publicar no broker em modo de teste |
-| INCLUDE_EVIDENCE | false | Anexar JPEG privado em base64 (falha secundária não impede o alerta) |
-| MAX_PENDING_EVENTS | 10000 | Limite de pendências na outbox; ao atingir, falha explicitamente |
-
-### Limitações Experimentais Confirmadas:
-1. **Cadência de captura vs. lacuna temporal**: Em ambientes com taxa de inferência ou amostragem mais lenta (intervalos de 0,8 segundo entre frames processados), a sequência temporal é interrompida pela lacuna máxima configurada de 0,5 segundo (`MAX_INTERVALO_S=0.5`), impedindo atingir os 8 frames necessários para o alerta.
-2. **Supressão por Cooldown Global**: O cooldown de 3,0 segundos é aplicado por câmera (`Motor.last_alert`). Se duas pessoas sofrerem eventos concorrentes, a segunda pessoa pode ter sua confirmação suprimida durante a vigência do cooldown da câmera, permanecendo sem alerta.
-
-Por padrão (`ALERT_TTL_S=0`), não há expiração automática no SQLite nem envio da propriedade `expiration` ao RabbitMQ. Caso configurado TTL positivo, alertas vencidos são removidos da outbox com log de aviso. A outbox é armazenamento local transitório de transporte, com preservação de pendentes em caso de indisponibilidade do broker.
-
-## 11. Trocar best.pt
-
-1. Preserve a versão anterior fora da pasta montada em produção.
-2. Pare o worker antes de substituir o arquivo.
-3. Envie o novo arquivo como `/opt/poolsafe/modelos/best.pt`.
-4. Atualize MODEL_VERSION e reinicie o serviço.
-5. Confira SHA-256 e classes no log.
-
-A troca de pesos não exige rebuild. Pesos precisam conter `pessoa_normal` e `pessoa_queda`.
-
-## 12. Testes e limites de validação
+Para executar a validação localmente:
 
 ```bash
-python -m unittest discover -s tests -v
+# Validação da sintaxe e compilação dos scripts Python
 python -m compileall -q .
+
+# Execução da suíte de 21 testes unitários isolados
+python -m unittest discover -s tests -v
+
+# Validação do Compose (fornecendo imagem de teste)
+WORKER_IMAGE=ghcr.io/poolsafe/poolsafe_integracao:ci-validate docker compose config
 ```
-
-21 testes automatizados executados com sucesso:
-- Regras temporais: persistência de frames, quebra por ausência, lacuna temporal, segregação de IDs, rearmamento e supressão de cooldown;
-- Transporte e persistência: reabertura SQLite, preservação de payload e identidade, limite com erro explícito, publicação mandatory e confirmação;
-- Topologia RabbitMQ: ausência estrita de declarações ativas de exchange/filas/bindings pelo produtor;
-- Expiração e TTL: risco sem TTL por padrão (omissão da propriedade AMQP `expiration`);
-- Evidência isolada: falhas de redimensionamento, codificação ou excesso de tamanho não descartam o alerta;
-- Desacoplamento do heartbeat: callback atrelado à captura confirmada, sem emissão periódica inventada e sem envio em modo vídeo;
-- Isolamento de testes: validação estrita bloqueando publicação de teste sem `ALLOW_TEST_PUBLISH=true` e sem `CODIGO_INTEGRACAO`;
-- Compatibilidade: adaptação transparente de registros legados da outbox;
-- Resiliência de transporte: parada coordenada do processo principal com motivo sanitizado e preservação da outbox em erros irrecuperáveis (payloads corrompidos ou autenticação recusada), mantendo reconexão automática contínua em falhas transitórias do broker.
-
-**Limitações de validação:** Os testes utilizam simulações sem modelo, câmera, broker ou banco reais. Não foram validados em ambiente de produção: carregamento de pesos proprietários `best.pt`, acurácia do modelo, performance GPU, decodificação RTSP/H.264 ao vivo, consumo de fila pelo n8n, MySQL ou entrega push FCM no aplicativo.
-
-## 13. Roteiro de aceitação da integração
-
-- Arquivo: conferir detecções/ausências e confirmar ausência de heartbeat em vídeo;
-- Broker: publicar com `ALLOW_TEST_PUBLISH=true` e verificar `eventKey` no n8n;
-- Falha: parar broker, gerar evento, reiniciar broker e conferir preservação da outbox e entrega única;
-- Duplicação: reprocessar mesmo `eventKey` e confirmar idempotência na API;
-- Câmera: validar captura de stream, reconexão e emissão do heartbeat de conectividade;
-- Pausa: comprovar que o Python publica normalmente e que o n8n descarta/confirma `409 ACTIVE_MONITORING_NOT_FOUND` sem loop de retentativas;
-- App: medir latência total ponta a ponta.
-
-## 14. Referências de implementação
-
-- Contrato de alertas da API PoolSafe: `POST /api/v1/internal/alerts`
-- Topologia oficial RabbitMQ: exchange `poolsafe.events` (`direct`), vhost `poolsafe`
-- Ultralytics tracking: https://docs.ultralytics.com/modes/track/
-- Pika publisher confirms: https://pika.readthedocs.io/en/stable/examples/blocking_delivery_confirmations.html
-- RabbitMQ confirms & TTL: https://www.rabbitmq.com/docs/confirms

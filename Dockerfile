@@ -4,7 +4,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-RUN groupadd -g 10001 poolsafe && useradd -u 10001 -g 10001 -M poolsafe && mkdir /dados && chown 10001:10001 /dados
+RUN groupadd -g 10001 poolsafe && useradd -u 10001 -g 10001 -M poolsafe && mkdir -p /dados /modelos /entrada && chown 10001:10001 /dados
 COPY *.py ./
 USER 10001:10001
 CMD ["python", "main.py"]

@@ -1,9 +1,15 @@
-# Construir a imagem NO HOST: docker build -t poolsafe-worker:2.0.0 .
-# Em Portainer, preencher as variáveis abaixo pela interface da Stack.
+name: poolsafe-worker
+
+# Stack Portainer para execução do worker Python PoolSafe
+# Integração: captura -> inferência (YOLO11) -> confirmação temporal -> outbox SQLite -> RabbitMQ
+# Reutiliza a rede externa 'poolsafe-network' e o broker 'rabbitmq:5672' (vhost 'poolsafe').
+# Não expõe portas externas nem cria serviços auxiliares.
+
 services:
   poolsafe:
-    image: poolsafe-worker:2.0.0
-    restart: "no" # Para câmera contínua, trocar para unless-stopped após validar.
+    image: ${WORKER_IMAGE:?Defina WORKER_IMAGE}
+    container_name: ${CONTAINER_NAME:-poolsafe-worker}
+    restart: "no" # Para primeiro ensaio; alterar para unless-stopped após homologação
     stop_grace_period: 45s
     init: true
     logging:
@@ -47,11 +53,11 @@ services:
       RABBIT_ALERT_KEY: ${RABBIT_ALERT_KEY:-risk.detected}
       RABBIT_HEARTBEAT_KEY: ${RABBIT_HEARTBEAT_KEY:-camera.heartbeat}
     volumes:
-      - ${HOST_MODEL_DIR:-/opt/poolsafe/modelos}:/modelos:ro
+      - ${HOST_MODEL_DIR:-/opt/poolsafe/modelos/releases/modelo-001}:/modelos:ro
       - ${HOST_VIDEO_DIR:-/opt/poolsafe/entrada}:/entrada:ro
-      - ${HOST_DATA_DIR:-/opt/poolsafe/dados/camera_teste_01}:/dados
+      - ${HOST_DATA_DIR:-/opt/poolsafe/dados/ensaio-modelo-001}:/dados
     networks:
-      - poolsafe_network
+      - poolsafe-network
     # GPU NVIDIA: descomentar após instalar NVIDIA Container Toolkit no host.
     # Também definir DEVICE=0. Validar driver/CUDA antes da demonstração.
     # deploy:
@@ -61,7 +67,8 @@ services:
     #         - driver: nvidia
     #           count: 1
     #           capabilities: [gpu]
+
 networks:
-  poolsafe_network:
+  poolsafe-network:
     external: true
     name: ${DOCKER_NETWORK:-poolsafe-network}

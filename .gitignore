@@ -1,0 +1,52 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Caches de ferramentas e linters
+.pytest_cache/
+.ruff_cache/
+.cache/
+
+# Ambientes virtuais
+.venv/
+venv/
+ENV/
+env/
+
+# Arquivos operacionais de ambiente e segredos locais (preservar .env.example)
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.crt
+
+# Pesos do modelo e mídias de vídeo (montados externamente)
+*.pt
+*.onnx
+*.engine
+*.mp4
+*.avi
+*.mkv
+*.mov
+
+# Diretórios operacionais de montagem e persistência
+modelos/
+entrada/
+dados/
+runs/
+
+# SQLite, WAL/SHM e logs operacionais
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# IDEs e sistema operacional
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
