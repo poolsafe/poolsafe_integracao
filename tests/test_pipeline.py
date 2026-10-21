@@ -54,9 +54,10 @@ class FakeCapture:
 
 
 class FakePublisher:
-    def __init__(self, cfg, outbox):
+    def __init__(self, cfg, outbox, stopping=None):
         self.hb = []
         self.stop_event = SimpleNamespace(set=lambda: None)
+        self.fatal_error = None
     def start(self):
         pass
     def heartbeat(self, *a):
@@ -78,6 +79,8 @@ class PipelineTest(unittest.TestCase):
             c.source = str(p/'teste.mp4')
             c.source_mode, c.data_dir, c.test = 'video', d, True
             c.publish, c.rabbit_user, c.rabbit_password = True, 'fake', 'fake'
+            c.allow_test_publish = True
+            c.codigo_integracao = 'cam_integracao_teste'
             c.evidence, c.frames = False, 3
             cap = FakeCapture()
             cv2 = SimpleNamespace(VideoCapture=lambda *_: cap, CAP_PROP_FPS=5)
@@ -89,12 +92,62 @@ class PipelineTest(unittest.TestCase):
                 worker.main()
             row = Outbox(p/'outbox.sqlite3').first()
             event = json.loads(row[2])
-            self.assertTrue(event['teste'])
-            self.assertEqual(event['origem'], 'video')
-            self.assertEqual(event['deteccao']['track_id'], 42)
-            self.assertEqual(event['frame_processado'], 3)
-            self.assertEqual(len(event['modelo']['sha256']), 64)
+            self.assertEqual(event['schemaVersion'], '1')
+            self.assertEqual(event['type'], 'POSSIVEL_RISCO')
+            self.assertEqual(event['severity'], 'CRITICA')
+            self.assertEqual(event['cameraCode'], 'cam_integracao_teste')
+            self.assertTrue(event['eventKey'])
+            self.assertTrue(event['detectedAt'].endswith('Z'))
+            self.assertTrue(event['technicalData']['test'])
+            self.assertEqual(event['technicalData']['source'], 'video')
+            self.assertEqual(event['technicalData']['trackId'], 42)
+            self.assertEqual(event['technicalData']['processedFrame'], 3)
+            self.assertEqual(len(event['technicalData']['modelSha256']), 64)
+            self.assertNotIn('evidence', event)
             self.assertEqual(Outbox(p/'outbox.sqlite3').count(), 1)
+            self.assertTrue(cap.closed)
+
+    def test_erro_irrecuperavel_publicador_encerra_main_preservando_outbox(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d)
+            (p/'best.pt').write_bytes(b'modelo-falso')
+            (p/'teste.mp4').write_bytes(b'captura-falsa')
+            c = Config()
+            c.model_path = str(p/'best.pt')
+            c.source = str(p/'teste.mp4')
+            c.source_mode, c.data_dir, c.test = 'video', d, True
+            c.publish, c.rabbit_user, c.rabbit_password = True, 'fake', 'fake'
+            c.allow_test_publish = True
+            c.codigo_integracao = 'cam_integracao_teste'
+            c.evidence, c.frames = False, 3
+
+            class FatalPublisher:
+                def __init__(self, cfg, outbox, stopping=None):
+                    self.cfg = cfg
+                    self.outbox = outbox
+                    self.stopping = stopping
+                    self.stop_event = SimpleNamespace(set=lambda: None)
+                    self.fatal_error = 'BrokerAuthRecusada: ProbableAuthenticationError'
+                def start(self):
+                    if self.stopping:
+                        self.stopping.set()
+                def is_alive(self):
+                    return False
+                def join(self, **kw):
+                    pass
+
+            cap = FakeCapture()
+            cv2 = SimpleNamespace(VideoCapture=lambda *_: cap, CAP_PROP_FPS=5)
+            ultra = SimpleNamespace(YOLO=lambda *_: FakeModel())
+            with patch.dict(sys.modules, {'cv2': cv2, 'ultralytics': ultra}), \
+                 patch.object(worker, 'Config', return_value=c), \
+                 patch.object(worker, 'Publisher', FatalPublisher), \
+                 patch.object(worker.signal, 'signal'):
+                with self.assertRaises(RuntimeError) as ctx:
+                    worker.main()
+                self.assertIn('ProbableAuthenticationError', str(ctx.exception))
+            # Outbox permanece intacta
+            self.assertEqual(Outbox(p/'outbox.sqlite3').count(), 0)
             self.assertTrue(cap.closed)
 
 

@@ -6,15 +6,21 @@ services:
     restart: "no" # Para câmera contínua, trocar para unless-stopped após validar.
     stop_grace_period: 45s
     init: true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       CAMERA_ID: ${CAMERA_ID:-camera_teste_01}
       CODIGO_INTEGRACAO: ${CODIGO_INTEGRACAO:-}
       SOURCE_MODE: ${SOURCE_MODE:-video}
       SOURCE: ${SOURCE:-/entrada/teste.mp4}
       MODEL_PATH: /modelos/best.pt
-      MODEL_VERSION: ${MODEL_VERSION:-v6}
+      MODEL_VERSION: ${MODEL_VERSION:-candidato}
       DEVICE: ${DEVICE:-cpu}
       TEST_MODE: ${TEST_MODE:-true}
+      ALLOW_TEST_PUBLISH: ${ALLOW_TEST_PUBLISH:-false}
       PUBLISH_RABBIT: ${PUBLISH_RABBIT:-false}
       INCLUDE_EVIDENCE: ${INCLUDE_EVIDENCE:-false}
       CONF: ${CONF:-0.25}
@@ -27,26 +33,25 @@ services:
       LOST_RESET_S: ${LOST_RESET_S:-2}
       HEARTBEAT_INTERVAL_S: ${HEARTBEAT_INTERVAL_S:-30}
       HEARTBEAT_TTL_S: ${HEARTBEAT_TTL_S:-60}
-      ALERT_TTL_S: ${ALERT_TTL_S:-120}
+      ALERT_TTL_S: ${ALERT_TTL_S:-0}
       DATA_DIR: /dados
       MAX_PENDING_EVENTS: ${MAX_PENDING_EVENTS:-10000}
       RABBIT_HOST: ${RABBIT_HOST:-rabbitmq}
       RABBIT_PORT: ${RABBIT_PORT:-5672}
-      RABBIT_VHOST: ${RABBIT_VHOST:-/}
-      RABBIT_USER: ${RABBIT_USER:-}
+      RABBIT_VHOST: ${RABBIT_VHOST:-poolsafe}
+      RABBIT_USER: ${RABBIT_USER:-poolsafe_python}
       RABBIT_PASSWORD: ${RABBIT_PASSWORD:-}
       RABBIT_TLS: ${RABBIT_TLS:-false}
-      RABBIT_EXCHANGE: ${RABBIT_EXCHANGE:-poolsafe.teste.eventos.v1}
-      RABBIT_ALERT_QUEUE: ${RABBIT_ALERT_QUEUE:-poolsafe.teste.alertas.v1}
-      RABBIT_HEARTBEAT_QUEUE: ${RABBIT_HEARTBEAT_QUEUE:-poolsafe.teste.heartbeat.v1}
-      RABBIT_ALERT_KEY: ${RABBIT_ALERT_KEY:-poolsafe.alerta}
-      RABBIT_HEARTBEAT_KEY: ${RABBIT_HEARTBEAT_KEY:-poolsafe.heartbeat}
+      RABBIT_CA_FILE: ${RABBIT_CA_FILE:-}
+      RABBIT_EXCHANGE: ${RABBIT_EXCHANGE:-poolsafe.events}
+      RABBIT_ALERT_KEY: ${RABBIT_ALERT_KEY:-risk.detected}
+      RABBIT_HEARTBEAT_KEY: ${RABBIT_HEARTBEAT_KEY:-camera.heartbeat}
     volumes:
       - ${HOST_MODEL_DIR:-/opt/poolsafe/modelos}:/modelos:ro
       - ${HOST_VIDEO_DIR:-/opt/poolsafe/entrada}:/entrada:ro
       - ${HOST_DATA_DIR:-/opt/poolsafe/dados/camera_teste_01}:/dados
     networks:
-      - rabbit_interna
+      - poolsafe_network
     # GPU NVIDIA: descomentar após instalar NVIDIA Container Toolkit no host.
     # Também definir DEVICE=0. Validar driver/CUDA antes da demonstração.
     # deploy:
@@ -57,6 +62,6 @@ services:
     #           count: 1
     #           capabilities: [gpu]
 networks:
-  rabbit_interna:
+  poolsafe_network:
     external: true
-    name: ${RABBIT_NETWORK:-poolsafe_interna}
+    name: ${DOCKER_NETWORK:-poolsafe-network}

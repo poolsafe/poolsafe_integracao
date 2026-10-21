@@ -13,13 +13,14 @@ log = logging.getLogger(__name__)
 
 
 def utc_now():
-    return datetime.now(timezone.utc).isoformat(timespec='milliseconds')
+    return datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
 
 
 class StreamReader(threading.Thread):
-    def __init__(self, source, stopping):
+    def __init__(self, source, stopping, on_frame_decoded=None):
         super().__init__(name='captura', daemon=True)
         self.source, self.stopping = source, stopping
+        self.on_frame_decoded = on_frame_decoded
         self.lock = threading.Lock()
         self.latest = None
 
@@ -47,8 +48,16 @@ class StreamReader(threading.Thread):
                             log.warning('Captura interrompida; reconectando')
                             break
                         sequence += 1
+                        now_mono = time.monotonic()
+                        now_utc = utc_now()
+                        now_epoch = time.time()
                         with self.lock:
-                            self.latest = (sequence, generation, frame, time.monotonic(), utc_now())
+                            self.latest = (sequence, generation, frame, now_mono, now_utc)
+                        if self.on_frame_decoded is not None:
+                            try:
+                                self.on_frame_decoded(now_utc, now_epoch)
+                            except Exception as exc:
+                                log.error('Erro no callback de captura: %s', type(exc).__name__)
             except Exception as exc:
                 log.error('Falha de captura: %s', type(exc).__name__)
             finally:

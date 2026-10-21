@@ -1,97 +1,116 @@
-# Contrato proposto Python -> RabbitMQ -> n8n
+# Contrato de Integração Python -> RabbitMQ -> n8n -> API
 
-**Proposta v1, configurável.** Nenhum endpoint, campo Prisma ou fluxo do aplicativo é criado por este pacote. O colega deve mapear este payload ao contrato real do domínio. Identificadores internos da câmera não devem ser inferidos pelo produtor; CODIGO_INTEGRACAO deve corresponder ao cadastro oficial. camera_id é identificação operacional do produtor; codigo_integracao é a chave para resolver a câmera no domínio.
+Este documento define o contrato oficial de comunicação do produtor Python integrado à infraestrutura existente do PoolSafe.
+O n8n consome as mensagens publicadas no RabbitMQ e as encaminha para a API:
+`POST http://poolsafe-api:3000/api/v1/internal/alerts`
 
-## Topologia
+## 1. Topologia RabbitMQ Oficial
 
-| Recurso | Padrão da Stack de teste |
-|---|---|
-| Exchange durável, tipo Topic | poolsafe.teste.eventos.v1 |
-| Routing key de alertas | poolsafe.alerta |
-| Routing key de heartbeat | poolsafe.heartbeat |
-| Fila durável de alertas | poolsafe.teste.alertas.v1 |
-| Fila durável de heartbeat | poolsafe.teste.heartbeat.v1 |
+| Item | Configuração Oficial | Papel |
+|---|---|---|
+| Rede Docker externa | `poolsafe-network` | Rede compartilhada entre contêineres |
+| Host e porta AMQP | `rabbitmq:5672` | Endpoint do broker RabbitMQ |
+| Vhost | `poolsafe` | Virtual host isolado |
+| Usuário produtor | `poolsafe_python` | Permissão estrita de publicação na exchange (sem gestão de filas/bindings) |
+| Exchange de eventos | `poolsafe.events` | Tipo `direct`, durável |
+| Routing key de risco | `risk.detected` | Encaminhamento para fila de alertas |
+| Routing key de heartbeat | `camera.heartbeat` | Encaminhamento para fila de conectividade |
+| Fila de risco existente | `poolsafe.risk` | Quorum queue consumida pelo workflow de alertas n8n |
+| Fila de heartbeat existente | `poolsafe.heartbeat` | Classic queue para monitoramento de conectividade da câmera |
 
-A exchange encaminha por routing key; o n8n consome as filas. Nome da fila não é routing key automaticamente. O padrão de heartbeat inclui TTL de fila 60000 ms. Nomes exclusivos de teste evitam alterar recursos já em uso.
+> **Importante**: O produtor Python NÃO realiza declarações ativas de exchange, filas ou bindings. A topologia é provisionada pela infraestrutura. Dead Letter Queues (DLQ) são administradas pelo broker e pelo n8n; o Python não publica diretamente nelas.
 
-## Alerta ilustrativo
+## 2. Envelope de Evento de Risco
 
-Os campos de hash/ID abaixo são exemplos, não resultados medidos.
-
-```json
-{
-  "schema_version": 1,
-  "event_id": "UUID-estavel-nas-tentativas",
-  "tipo": "alerta",
-  "camera_id": "camera_teste_01",
-  "codigo_integracao": "codigo-cadastrado-no-dominio",
-  "observado_em": "2026-10-19T01:00:00.000+00:00",
-  "confirmado_em": "2026-10-19T01:00:00.100+00:00",
-  "expira_em": "2026-10-19T01:02:00.000+00:00",
-  "teste": true,
-  "origem": "video",
-  "run_id": "UUID-da-execucao",
-  "segmento": 0,
-  "frame_processado": 150,
-  "video_time_s": 4.9667,
-  "modelo": {"versao": "v6", "sha256": "HASH_REAL_DO_ARQUIVO"},
-  "deteccao": {
-    "track_id": 7,
-    "classe": "pessoa_queda",
-    "confianca": 0.82,
-    "bbox_xyxy": [100, 80, 300, 400]
-  },
-  "regra": {
-    "frames_consecutivos": 8,
-    "conf_minima": 0.25,
-    "frames_normais_encerrar": 15,
-    "cooldown_s": 3,
-    "max_intervalo_s": 0.5
-  },
-  "evidencia": null
-}
-```
-
-bbox_xyxy usa pixels do frame original; confiança da caixa não é acurácia. O frame de confirmação é distinto do início do evento. Em stream, video_time_s é null. observado_em é tempo UTC de decodificação, não timestamp garantido do sensor. Em vídeo, é tempo de reprodução e o campo teste é obrigatoriamente true. segmento/run_id delimitam a validade do track_id; IDs não são globais ou cadastros de pessoas.
-
-Quando habilitada, evidencia contém `mime_type: image/jpeg` e `jpeg_base64`. É um JPEG sem caixas, reduzido a no máximo 640 pixels na maior dimensão, até 250000 bytes antes de base64. Falha de codificação ou tamanho excedido deixa evidencia=null. Não existe URL pública. O consumidor deve impor limites e armazenamento privado, com acesso exclusivamente pela API autenticada do aplicativo. A imagem fica temporariamente no transporte/outbox até confirmação de publicação; este pacote não cria armazenamento definitivo de evidências no domínio.
-
-## Heartbeat ilustrativo
+Publicado na exchange `poolsafe.events` com routing key `risk.detected`.
 
 ```json
 {
-  "schema_version": 1,
-  "event_id": "UUID-do-heartbeat",
-  "tipo": "heartbeat",
-  "camera_id": "camera_teste_01",
-  "codigo_integracao": "codigo-cadastrado-no-dominio",
-  "observado_em": "2026-10-19T01:00:00.000+00:00",
-  "expira_em": "2026-10-19T01:01:00.000+00:00",
-  "teste": true
+  "schemaVersion": "1",
+  "eventKey": "c1f7a2d8-4f8e-4a6c-9c71-2b0e9f3b1a11",
+  "cameraCode": "CAM_PISCINA_01",
+  "type": "POSSIVEL_RISCO",
+  "severity": "CRITICA",
+  "detectedAt": "2026-10-21T01:15:30.125Z",
+  "confidence": 0.82,
+  "modelVersion": "candidato",
+  "technicalData": {
+    "test": true,
+    "source": "video",
+    "runId": "a8e932b1-12c4-4b90-9ef1-4b7194ad825e",
+    "segment": 0,
+    "trackId": 7,
+    "processedFrame": 150,
+    "videoTimeSeconds": 4.9667,
+    "modelSha256": "7e75a1664e219d195e6c57782dad7e997f121cd756eb0c86e556fe85074f3331"
+  },
+  "evidence": {
+    "mimeType": "image/jpeg",
+    "base64": "/9j/4AAQSkZJRgABAQAAAQABAAD..."
+  }
 }
 ```
 
-Não significa que o detector ou app estejam funcionando. Nunca emitir a partir de arquivo para atualizar uma câmera real como online. No consumidor, heartbeats de teste devem ser isolados dos cadastros operacionais.
+### Regras do Envelope de Risco:
+- `schemaVersion`: string `"1"`.
+- `eventKey`: UUID estável gerado uma única vez, reutilizado em reenvios e usado como AMQP `message_id`. A API possui idempotência por `eventKey`.
+- `cameraCode`: chave pública de integração da câmera (`codigo_integracao` cadastrado no domínio). Não é o ID numérico/interno de banco de dados. Exigido obrigatoriamente se a publicação estiver habilitada.
+- `type`: `"POSSIVEL_RISCO"`.
+- `severity`: `"CRITICA"`.
+- `detectedAt`: instante de decodificação UTC com precisão de milissegundos e sufixo `Z` do frame que completou a confirmação temporal. Preservado em retries.
+- `confidence`: valor numérico float de confiança da detecção.
+- `modelVersion`: string identificadora da versão dos pesos.
+- `technicalData`: metadados técnicos de tracking e execução (limitado a 16 KiB, sem imagem, sem URL ou credenciais). `videoTimeSeconds` é `null` em streams ao vivo.
+- `evidence`: objeto opcional com `mimeType` e `base64`. É **omitido** se o envio de evidência estiver desabilitado, ou se houver falha de redimensionamento/codificação JPEG ou se ultrapassar 250.000 bytes.
+- O payload NÃO contém dados de usuários, IDs de monitoramento ou tokens FCM (responsabilidade do domínio/API).
 
-## Obrigações do consumidor
+## 3. Envelope de Heartbeat de Conectividade
 
-1. Validar JSON, versão, tipo, tamanho, campos, datas e a associação oficial da câmera. Não confiar em IDs enviados sem resolver cadastro/autorização no domínio.
-2. Tratar `teste=true` em fluxo isolado, com destinatário de teste explícito. Não notificar usuários reais acidentalmente.
-3. Comparar expira_em com relógio sincronizado; mensagens vencidas não devem gerar aviso novo. TTL do RabbitMQ não valida sozinho o instante do evento.
-4. Para heartbeat, rejeitar instantes inválidos, antigos ou futuros fora da tolerância definida pela equipe. Avançar ultima_comunicacao_em só se observado_em for maior. Não gravar ONLINE/OFFLINE: API deriva conectividade.
-5. Para alerta, deduplicar event_id de forma durável e transacional. Retransmissão do mesmo ID não deve criar um segundo alerta/notificação. `track_id` NÃO é chave de idempotência.
-6. Aplicar estado da sessão/pausa conforme API/banco canônicos. Python continua publicando. Durante pausa, registrar de acordo com o domínio e não enviar notificação. Para eventos atrasados, definir explicitamente se a decisão usa o estado na observação ou no consumo; este produtor não possui monitoramento_id nem histórico de sessão.
-7. Persistir alerta/evidência/destinatários conforme migrations e contratos reais. Não improvisar SQL ou tabelas a partir deste exemplo.
-8. Definir entrega de notificações idempotente: persistir intenção/estado de entrega para retries, sem marcar um evento como inteiramente concluído antes de tratar as etapas necessárias. Falha no FCM precisa ser retomável sem duplicar o alerta.
-9. ACK somente depois do marco durável definido pelo workflow. Se o nó n8n usado confirmar automaticamente antes do processamento, documentar a limitação ou usar um consumidor que exponha ACK/retry adequados. Não há garantia de consumo implementada por este pacote.
-10. Definir retries limitados e DLQ para falhas permanentes; evitar requeue infinito de payload inválido. Definir retenção e expurgo de eventos/imagens.
+Publicado na exchange `poolsafe.events` com routing key `camera.heartbeat`.
 
-O produtor usa publisher confirms e mandatory, preserva pendentes no SQLite e reenvia com mesmo event_id. Pode duplicar após aceitação pelo broker se cair antes de remover da outbox. Confirm do broker não é recebimento pelo n8n nem pelo aplicativo. Eventos com IDs novos, mesmo que semelhantes, são episódios distintos para o transporte: eventual deduplicação semântica precisa de regra própria e avaliação.
+```json
+{
+  "schemaVersion": "1",
+  "eventKey": "7b83c180-87a4-43ea-9c09-fa936a58fbe8",
+  "type": "CAMERA_HEARTBEAT",
+  "cameraCode": "CAM_PISCINA_01",
+  "observedAt": "2026-10-21T01:15:30.000Z",
+  "expiresAt": "2026-10-21T01:16:30.000Z",
+  "technicalData": {
+    "test": true
+  }
+}
+```
 
-## Validade e expiração
+### Regras do Heartbeat:
+- Emitido a partir da decodificação confirmada de frames reais pela thread de captura (`StreamReader`), independente da duração ou avanço da inferência YOLO.
+- Nunca é emitido em modo vídeo (`source_mode=video`).
+- Não é emitido na ausência de novos frames ou se a conexão de stream for interrompida.
+- Somente o heartbeat mais recente permanece retido em memória aguardando envio.
+- Intervalo nominal de 30 segundos; validade de 60 segundos. A API adota janela de tolerância de 90 segundos para determinar estado offline.
+- O consumidor n8n/API deve validar timestamps e avançar `ultima_comunicacao_em` apenas para instantes mais recentes, sem inventar persistência na ausência de captura.
 
-Alertas têm validade operacional proposta de 120 segundos desde a observação do frame de confirmação. Antes de publicar, o worker calcula TTL remanescente. Expirados locais são removidos com aviso no log, e não arquivados como histórico completo. Heartbeats expiram em 60 segundos; somente o mais recente fica pendente na memória. Ajustar as janelas à política do domínio antes de operação definitiva.
+## 4. Pausa de Monitoramento e Regras de Negócio no n8n
 
-## Meta de oito segundos
+O produtor Python opera continuamente e de forma desacoplada, publicando detecções independentemente de existir sessão ativa ou pausa.
 
-Registrar início humano anotado, frame de confirmação, publicação, consumo, persistência e recebimento no dispositivo. Sincronizar relógios. O pacote fornece observado_em/confirmado_em, mas não mede sozinho início de queda, atraso do sensor ou entrega. Medir latência só dos acertos sem informar eventos perdidos produz avaliação incompleta.
+A **API Node.js é a autoridade de negócio**:
+1. Para cada alerta recebido, a API verifica se existe exatamente uma sessão de monitoramento `ATIVO` vinculada à câmera.
+2. **Sessão Pausada / Inexistente**: se a API retornar erro HTTP `409` com código `ACTIVE_MONITORING_NOT_FOUND`, o n8n deve tratar como **recusa de negócio normal**:
+   - A API não cria alertas nem dispara notificações FCM aos usuários.
+   - **Orientação crítica para o n8n**: O nó de requisição HTTP **NÃO DEVE** retentar esse erro automaticamente ou reencaminhar a mensagem para a fila aguardando uma suposta retomada. O n8n deve confirmar a mensagem (ACK) ou arquivar o log operacional. Essa regra é estrita para `ACTIVE_MONITORING_NOT_FOUND` e não deve ser generalizada para outros erros 409.
+3. Não há garantia nem promessa de repositório histórico no Python para eventos recusados durante a pausa.
+4. Alertas aceitos antes de uma pausa concluem seu ciclo de entrega normalmente.
+
+## 5. Expiração e Política de TTL
+
+- **Padrão**: `ALERT_TTL_S=0` (sem expiração automática no produtor; mensagens são publicadas sem a propriedade AMQP `expiration`).
+- O RabbitMQ não deve receber `"0"` como string de expiração.
+- Se configurado com valor positivo (`ALERT_TTL_S > 0`), mensagens vencidas na outbox local antes da publicação serão descartadas com aviso em log.
+
+## 6. Isolamento de Testes
+
+- `TEST_MODE=true` e `PUBLISH_RABBIT=false` são os padrões de segurança.
+- O campo `technicalData.test` é informativo e não impede processamento pela API.
+- Para publicar no RabbitMQ em modo de teste, é mandatória a liberação explícita `ALLOW_TEST_PUBLISH=true`. Sem ela, o serviço falha imediatamente na inicialização.
+- Ambientes de teste devem utilizar câmeras de teste com `CODIGO_INTEGRACAO` específico e workflows n8n com destinatários controlados.

@@ -24,24 +24,64 @@ from transporte import Outbox, Publisher
 log = logging.getLogger('poolsafe')
 
 
-def iso_at(seconds):
-    return datetime.fromtimestamp(seconds, timezone.utc).isoformat(timespec='milliseconds')
+def format_utc_iso(seconds=None):
+    dt = datetime.fromtimestamp(seconds, timezone.utc) if seconds is not None else datetime.now(timezone.utc)
+    return dt.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+
+
+def prepare_evidence(frame, max_dim=640, quality=70, max_bytes=250_000):
+    """Gera JPEG compacto sem anotações. Falhas secundárias não impedem o evento."""
+    try:
+        import cv2
+        h, w = frame.shape[:2]
+        if h <= 0 or w <= 0:
+            log.warning('Evidência descartada: dimensões de frame inválidas (%sx%s)', w, h)
+            return None
+        scale = min(1.0, max_dim / max(h, w))
+        target_w = max(1, int(w * scale))
+        target_h = max(1, int(h * scale))
+        small = cv2.resize(frame, (target_w, target_h))
+        ok, jpeg = cv2.imencode('.jpg', small, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if not ok or jpeg is None:
+            log.warning('Evidência descartada: falha na codificação JPEG')
+            return None
+        raw = jpeg.tobytes() if hasattr(jpeg, 'tobytes') else bytes(jpeg)
+        if len(raw) > max_bytes:
+            log.warning('Evidência descartada: limite de tamanho excedido (%d > %d bytes)', len(raw), max_bytes)
+            return None
+        return {
+            'mimeType': 'image/jpeg',
+            'base64': base64.b64encode(raw).decode('ascii')
+        }
+    except Exception as exc:
+        log.warning('Evidência descartada por exceção (%s)', type(exc).__name__)
+        return None
 
 
 def setup_logs(directory):
     directory.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-    # Logs com rotação: não ocupar disco ilimitadamente durante monitoramento contínuo.
-    handler = RotatingFileHandler(directory / 'servico.log', maxBytes=5_000_000, backupCount=5)
-    handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
-    logging.getLogger().addHandler(handler)
+    service_handler = RotatingFileHandler(directory / 'servico.log', maxBytes=5_000_000, backupCount=5)
+    service_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+    logging.getLogger().addHandler(service_handler)
     logging.getLogger('pika').setLevel(logging.WARNING)
+
     audit = logging.getLogger('deteccoes')
     audit.setLevel(logging.INFO)
     audit.propagate = False
-    audit.addHandler(RotatingFileHandler(directory / 'deteccoes.jsonl',
-                                         maxBytes=10_000_000, backupCount=5))
-    return audit
+    audit_handler = RotatingFileHandler(directory / 'deteccoes.jsonl', maxBytes=10_000_000, backupCount=5)
+    audit.addHandler(audit_handler)
+    return audit, [service_handler, audit_handler]
+
+
+def close_logs(handlers):
+    for h in handlers:
+        try:
+            h.close()
+            logging.getLogger().removeHandler(h)
+            logging.getLogger('deteccoes').removeHandler(h)
+        except Exception:
+            pass
 
 
 def new_motor(c):
@@ -52,57 +92,92 @@ def main():
     c = Config()
     c.validate()
     directory = Path(c.data_dir)
-    audit = setup_logs(directory)
-    # Bibliotecas pesadas são carregadas só na execução; os testes da lógica não
-    # precisam baixar pesos, instalar CUDA ou abrir uma câmera.
-    import cv2
-    from ultralytics import YOLO
-
-    model = YOLO(c.model_path)
-    names = {int(k): str(v).strip().lower() for k, v in model.names.items()}
-    expected = {c.risk_class, c.normal_class}
-    if not expected.issubset(names.values()):
-        raise ValueError(f'Classes incompatíveis: best contém {names}; esperado {expected}')
-    if any(v not in expected for v in names.values()):
-        raise ValueError('Esta implementação exige o modelo com apenas as duas classes configuradas')
-    with open(c.model_path, 'rb') as weights:
-        sha = hashlib.file_digest(weights, 'sha256').hexdigest()
-    log.info('Modelo versão=%s sha256=%s classes=%s device=%s', c.model_version, sha, names, c.device)
-    log.info('Modo=%s teste=%s publicação=%s; frames=%s cooldown=%ss',
-             c.source_mode, c.test, c.publish, c.frames, c.cooldown)
-    if c.source_mode == 'video' and not c.test:
-        raise ValueError('Vídeo gravado exige TEST_MODE=true para não se passar por evento real')
-
+    audit, log_handlers = setup_logs(directory)
     stopping = threading.Event()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda *_: stopping.set())
-    outbox = Outbox(directory / 'outbox.sqlite3', c.max_pending)
-    publisher = Publisher(c, outbox) if c.publish else None
-    if publisher:
-        publisher.start()
     reader = None
     cap = None
-    motor = new_motor(c)
-    run_id = str(uuid.uuid4())
-    generation = 0
+    publisher = None
     frame_number = 0
-    hb_last = float('-inf')
-    started = time.monotonic()
-    wait_log = started
-    if c.source_mode == 'stream':
-        reader = StreamReader(c.source, stopping)
-        reader.start()
-    else:
-        cap = cv2.VideoCapture(c.source)
-        if not cap.isOpened():
-            raise ValueError('Não foi possível abrir o vídeo')
-    fps = cap.get(cv2.CAP_PROP_FPS) if cap else None
-    if cap and (not fps or fps <= 0):
-        cap.release()
-        raise ValueError('FPS inválido: recodifique o vídeo com taxa conhecida')
+    outbox = Outbox(directory / 'outbox.sqlite3', c.max_pending)
 
     try:
+        # Bibliotecas pesadas são carregadas só na execução; os testes da lógica não
+        # precisam baixar pesos, instalar CUDA ou abrir uma câmera.
+        import cv2
+        from ultralytics import YOLO
+
+        model = YOLO(c.model_path)
+        names = {int(k): str(v).strip().lower() for k, v in model.names.items()}
+        expected = {c.risk_class, c.normal_class}
+        if not expected.issubset(names.values()):
+            raise ValueError(f'Classes incompatíveis: best contém {names}; esperado {expected}')
+        if any(v not in expected for v in names.values()):
+            raise ValueError('Esta implementação exige o modelo com apenas as duas classes configuradas')
+        with open(c.model_path, 'rb') as weights:
+            sha = hashlib.file_digest(weights, 'sha256').hexdigest()
+        log.info('Modelo versão=%s sha256=%s classes=%s device=%s', c.model_version, sha, names, c.device)
+        log.info('Modo=%s teste=%s publicação=%s; frames=%s cooldown=%ss',
+                 c.source_mode, c.test, c.publish, c.frames, c.cooldown)
+        if c.source_mode == 'video' and not c.test:
+            raise ValueError('Vídeo gravado exige TEST_MODE=true para não se passar por evento real')
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, lambda *_: stopping.set())
+        publisher = Publisher(c, outbox, stopping=stopping) if c.publish else None
+        if publisher:
+            publisher.start()
+
+        motor = new_motor(c)
+        run_id = str(uuid.uuid4())
+        generation = 0
+        hb_last = float('-inf')
+        hb_lock = threading.Lock()
+        started = time.monotonic()
+        wait_log = started
+
+        def on_stream_frame(observed_iso, observed_epoch):
+            nonlocal hb_last
+            with hb_lock:
+                if observed_epoch - hb_last < c.heartbeat_interval:
+                    return
+                hb_last = observed_epoch
+
+            camera_code = c.codigo_integracao or c.camera_id
+            expires_epoch = observed_epoch + c.heartbeat_ttl
+            hb_body = {
+                'schemaVersion': '1',
+                'eventKey': str(uuid.uuid4()),
+                'type': 'CAMERA_HEARTBEAT',
+                'cameraCode': camera_code,
+                'observedAt': observed_iso,
+                'expiresAt': format_utc_iso(expires_epoch),
+                'technicalData': {
+                    'test': c.test
+                }
+            }
+            if publisher:
+                publisher.heartbeat(hb_body, expires_epoch)
+            else:
+                log.info('Heartbeat local cameraCode=%s observedAt=%s', camera_code, observed_iso)
+
+        if c.source_mode == 'stream':
+            reader = StreamReader(c.source, stopping, on_frame_decoded=on_stream_frame)
+            reader.start()
+        else:
+            cap = cv2.VideoCapture(c.source)
+            if not cap.isOpened():
+                raise ValueError('Não foi possível abrir o vídeo')
+        fps = cap.get(cv2.CAP_PROP_FPS) if cap else None
+        if cap and (not fps or fps <= 0):
+            cap.release()
+            raise ValueError('FPS inválido: recodifique o vídeo com taxa conhecida')
+
         while not stopping.is_set():
+            if publisher and publisher.fatal_error:
+                log.error('Encerramento controlado acionado: publicador finalizou com erro irrecuperável (%s). Preservando outbox.',
+                          publisher.fatal_error)
+                stopping.set()
+                break
             video_time = None
             if reader:
                 packet = reader.take()
@@ -124,30 +199,16 @@ def main():
                     motor = new_motor(c)
                     log.info('Novo segmento de captura: %s; tracking reiniciado', segment)
                 logical_time = captured_mono
-                if captured_mono - hb_last >= c.heartbeat_interval:
-                    hb_last = captured_mono
-                    observed_epoch = datetime.fromisoformat(observed).timestamp()
-                    body = {'schema_version': 1, 'event_id': str(uuid.uuid4()),
-                            'tipo': 'heartbeat', 'camera_id': c.camera_id,
-                            'codigo_integracao': c.codigo_integracao or c.camera_id,
-                            'observado_em': observed,
-                            'expira_em': iso_at(observed_epoch + c.heartbeat_ttl), 'teste': c.test}
-                    if publisher:
-                        publisher.heartbeat(body, observed_epoch + c.heartbeat_ttl)
-                    else:
-                        log.info('Heartbeat local camera_id=%s observado_em=%s', c.camera_id, observed)
             else:
                 ok, frame = cap.read()
                 if not ok:
                     log.info('Fim do vídeo, ou erro de leitura; conferir quantidade de frames no ensaio')
                     break
-                # Reproduzir no ritmo nominal evita enviar em poucos segundos
-                # os eventos de um vídeo de vários minutos durante a demonstração.
                 video_time = frame_number / fps
                 if stopping.wait(max(0, started + video_time - time.monotonic())):
                     break
                 logical_time = video_time
-                observed = utc_now()  # Instante de reprodução, NÃO data original da gravação.
+                observed = format_utc_iso()  # Instante de reprodução com Z
                 capture_sequence = frame_number + 1
 
             frame_number += 1
@@ -170,13 +231,10 @@ def main():
                     detections.append(d)
                     if tid is None:
                         continue  # Detecção sem ID é auditada, mas não confirma por identidade.
-                    # Se houver caixas concorrentes com mesmo ID, usar a mais confiante.
                     if tid not in selected or score > selected[tid]['confianca']:
                         selected[tid] = d
                         observations[tid] = label == c.risk_class
             decisions = motor.update(observations, frame_number, logical_time)
-            # Há uma linha para TODO frame processado, incluindo vazio e sem ID.
-            # Frames descartados pelo slot não entram nesta contagem.
             audit.info(json.dumps({'run_id': run_id, 'segmento': generation,
                                    'frame_processado': frame_number,
                                    'frame_capturado': capture_sequence,
@@ -187,38 +245,44 @@ def main():
                 if decision != 'confirmado':
                     log.info('Confirmação suprimida por cooldown camera=%s track=%s', c.camera_id, tid)
                     continue
-                event_id = str(uuid.uuid4())
-                confirmed_epoch = time.time()
-                expires = datetime.fromisoformat(observed).timestamp() + c.alert_ttl
-                event = {'schema_version': 1, 'event_id': event_id, 'tipo': 'alerta',
-                         'camera_id': c.camera_id,
-                         'codigo_integracao': c.codigo_integracao or c.camera_id,
-                         'observado_em': observed, 'confirmado_em': iso_at(confirmed_epoch),
-                         'expira_em': iso_at(expires), 'teste': c.test,
-                         'origem': 'video' if cap else 'stream',
-                         'run_id': run_id, 'segmento': generation,
-                         'frame_processado': frame_number, 'video_time_s': video_time,
-                         'modelo': {'versao': c.model_version, 'sha256': sha},
-                         'deteccao': selected[tid],
-                         'regra': {'frames_consecutivos': c.frames, 'conf_minima': c.conf,
-                                   'frames_normais_encerrar': c.normal_frames,
-                                   'cooldown_s': c.cooldown, 'max_intervalo_s': c.max_gap},
-                         'evidencia': None}
+
+                event_key = str(uuid.uuid4())
+                camera_code = c.codigo_integracao or c.camera_id
+                if c.alert_ttl > 0:
+                    observed_epoch = datetime.fromisoformat(observed.replace('Z', '+00:00')).timestamp()
+                    expires = observed_epoch + c.alert_ttl
+                else:
+                    expires = 0.0
+
+                event = {
+                    'schemaVersion': '1',
+                    'eventKey': event_key,
+                    'cameraCode': camera_code,
+                    'type': 'POSSIVEL_RISCO',
+                    'severity': 'CRITICA',
+                    'detectedAt': observed,
+                    'confidence': round(float(selected[tid]['confianca']), 4),
+                    'modelVersion': c.model_version,
+                    'technicalData': {
+                        'test': c.test,
+                        'source': 'video' if cap else 'stream',
+                        'runId': run_id,
+                        'segment': generation,
+                        'trackId': tid,
+                        'processedFrame': frame_number,
+                        'videoTimeSeconds': round(video_time, 4) if video_time is not None else None,
+                        'modelSha256': sha
+                    }
+                }
                 if c.evidence:
-                    # Opcional e privado: JPEG reduzido dentro da mensagem, sem URL pública.
-                    # O contrato n8n precisa aceitar/decodificar o campo antes de habilitar.
-                    h, w = frame.shape[:2]
-                    scale = min(1., 640 / max(h, w))
-                    small = cv2.resize(frame, (max(1, int(w * scale)), max(1, int(h * scale))))
-                    ok, jpeg = cv2.imencode('.jpg', small, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                    if ok and len(jpeg) <= 250_000:
-                        event['evidencia'] = {'mime_type': 'image/jpeg',
-                                             'jpeg_base64': base64.b64encode(jpeg).decode()}
+                    ev = prepare_evidence(frame)
+                    if ev:
+                        event['evidence'] = ev
+
                 if publisher:
                     outbox.put(event, expires)
-                # Não escrever imagem/base64 nos logs. event_id permite correlação.
-                log.info('Evento local=%s camera=%s track=%s video_time=%s publicação=%s',
-                         event_id, c.camera_id, tid, video_time, c.publish)
+                log.info('Evento local=%s cameraCode=%s track=%s video_time=%s publicação=%s',
+                         event_key, camera_code, tid, video_time, c.publish)
     finally:
         stopping.set()
         if cap:
@@ -226,19 +290,24 @@ def main():
         if reader:
             reader.join(timeout=6)
         if publisher:
-            deadline = time.monotonic() + c.drain_seconds
-            while publisher.is_alive() and outbox.count() and time.monotonic() < deadline:
-                time.sleep(.1)
-            publisher.stop_event.set()
-            publisher.join(timeout=12)
+            if not getattr(publisher, 'fatal_error', None):
+                deadline = time.monotonic() + c.drain_seconds
+                while publisher.is_alive() and outbox.count() and time.monotonic() < deadline:
+                    time.sleep(.1)
+            if hasattr(publisher, 'stop_event'):
+                publisher.stop_event.set()
+            if hasattr(publisher, 'join'):
+                publisher.join(timeout=12)
         log.info('Encerrado: frames_processados=%s pendentes_outbox=%s', frame_number, outbox.count())
+        close_logs(log_handlers)
+        if publisher and getattr(publisher, 'fatal_error', None):
+            raise RuntimeError(f'Publicador encerrou com erro irrecuperável: {publisher.fatal_error}')
 
 
 if __name__ == '__main__':
     try:
         main()
     except Exception as exc:
-        # Mensagens de bibliotecas podem conter SOURCE com senha. Registrar só o tipo.
         log.error('Serviço interrompido (%s). Conferir arquivos, configuração, permissões e recursos.',
                   type(exc).__name__)
         raise SystemExit(1)

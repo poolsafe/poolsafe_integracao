@@ -33,8 +33,9 @@ class Config:
     lost_reset: float = float(os.getenv('LOST_RESET_S', '2'))
     heartbeat_interval: float = float(os.getenv('HEARTBEAT_INTERVAL_S', '30'))
     heartbeat_ttl: float = float(os.getenv('HEARTBEAT_TTL_S', '60'))
-    alert_ttl: float = float(os.getenv('ALERT_TTL_S', '120'))
+    alert_ttl: float = float(os.getenv('ALERT_TTL_S', '0'))
     test: bool = flag('TEST_MODE', True)
+    allow_test_publish: bool = flag('ALLOW_TEST_PUBLISH', False)
     publish: bool = flag('PUBLISH_RABBIT', False)
     evidence: bool = flag('INCLUDE_EVIDENCE', False)
     data_dir: str = os.getenv('DATA_DIR', '/dados')
@@ -42,16 +43,14 @@ class Config:
     drain_seconds: float = float(os.getenv('SHUTDOWN_DRAIN_S', '15'))
     rabbit_host: str = os.getenv('RABBIT_HOST', 'rabbitmq')
     rabbit_port: int = int(os.getenv('RABBIT_PORT', '5672'))
-    rabbit_vhost: str = os.getenv('RABBIT_VHOST', '/')
+    rabbit_vhost: str = os.getenv('RABBIT_VHOST', 'poolsafe')
     rabbit_user: str = os.getenv('RABBIT_USER', '')
     rabbit_password: str = os.getenv('RABBIT_PASSWORD', '')
     rabbit_tls: bool = flag('RABBIT_TLS', False)
     rabbit_ca: str = os.getenv('RABBIT_CA_FILE', '')
-    exchange: str = os.getenv('RABBIT_EXCHANGE', 'poolsafe.eventos.v1')
-    alert_queue: str = os.getenv('RABBIT_ALERT_QUEUE', 'poolsafe.alertas.v1')
-    heartbeat_queue: str = os.getenv('RABBIT_HEARTBEAT_QUEUE', 'poolsafe.heartbeat.v1')
-    alert_key: str = os.getenv('RABBIT_ALERT_KEY', 'poolsafe.alerta')
-    heartbeat_key: str = os.getenv('RABBIT_HEARTBEAT_KEY', 'poolsafe.heartbeat')
+    exchange: str = os.getenv('RABBIT_EXCHANGE', 'poolsafe.events')
+    alert_key: str = os.getenv('RABBIT_ALERT_KEY', 'risk.detected')
+    heartbeat_key: str = os.getenv('RABBIT_HEARTBEAT_KEY', 'camera.heartbeat')
 
     def validate(self):
         if self.source_mode not in {'video', 'stream'}:
@@ -66,11 +65,20 @@ class Config:
             raise ValueError('CONF e IOU devem estar entre 0 e 1')
         if min(self.frames, self.normal_frames, self.imgsz, self.max_pending) < 1:
             raise ValueError('Contagens e resolução precisam ser positivas')
+        if self.alert_ttl < 0:
+            raise ValueError('ALERT_TTL_S deve ser maior ou igual a zero')
         if min(self.max_gap, self.lost_reset, self.heartbeat_interval,
-               self.heartbeat_ttl, self.alert_ttl, self.drain_seconds) <= 0 or self.cooldown < 0:
+               self.heartbeat_ttl, self.drain_seconds) <= 0 or self.cooldown < 0:
             raise ValueError('Intervalos inválidos')
         if self.heartbeat_interval >= self.heartbeat_ttl:
             raise ValueError('TTL do heartbeat precisa superar seu intervalo')
+        if self.publish and not self.codigo_integracao:
+            raise ValueError('CODIGO_INTEGRACAO é obrigatório quando a publicação estiver habilitada')
+        if self.publish and self.test and not self.allow_test_publish:
+            raise ValueError(
+                'Publicação em modo de teste exige liberação explícita (ALLOW_TEST_PUBLISH=true). '
+                'Essa configuração requer destino, workflow e câmera com destinatários controlados.'
+            )
         if self.publish and not (self.rabbit_user and self.rabbit_password):
             raise ValueError('Informe RABBIT_USER e RABBIT_PASSWORD')
         if not self.test and not self.codigo_integracao:
