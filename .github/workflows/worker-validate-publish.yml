@@ -48,6 +48,23 @@ jobs:
       - name: Checkout do repositório
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      - name: Liberar espaço em disco no runner
+        run: |
+          echo "=== Espaço em disco antes da limpeza ==="
+          df -h /
+          # Remove toolchains e SDKs pesados pré-instalados no runner (Android, .NET, Haskell, JVM, etc.)
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/lib/jvm
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker system prune -af --volumes
+          sudo apt-get clean
+          echo "=== Espaço em disco após limpeza ==="
+          df -h /
+
       - name: Configurar Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
@@ -77,7 +94,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=min
 
       - name: Verificar instalação e importação das dependências dentro da imagem
         run: |
