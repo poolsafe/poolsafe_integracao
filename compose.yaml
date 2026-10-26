@@ -25,6 +25,7 @@ services:
       MODEL_PATH: /modelos/best.pt
       MODEL_VERSION: ${MODEL_VERSION:-candidato}
       DEVICE: ${DEVICE:-cpu}
+      LOG_MODE: ${LOG_MODE:-production}
       TEST_MODE: ${TEST_MODE:-true}
       ALLOW_TEST_PUBLISH: ${ALLOW_TEST_PUBLISH:-false}
       PUBLISH_RABBIT: ${PUBLISH_RABBIT:-false}

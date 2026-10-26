@@ -59,12 +59,15 @@ def adapt_legacy_payload(body):
     if conf is None:
         conf = det.get('confianca', 0.0)
 
+    severity = body.get('severity') or body.get('severidade') or 'CRITICA'
+    detected_class = det.get('classe') or body.get('detectedClass') or body.get('classe') or 'pessoa_queda'
+
     adapted = {
         'schemaVersion': '1',
         'eventKey': event_key,
         'cameraCode': camera_code,
         'type': 'POSSIVEL_RISCO',
-        'severity': 'CRITICA',
+        'severity': severity,
         'detectedAt': observed_at,
         'confidence': float(conf),
         'modelVersion': str(body.get('modelVersion') or model.get('versao') or 'candidato'),
@@ -76,7 +79,8 @@ def adapt_legacy_payload(body):
             'trackId': det.get('track_id'),
             'processedFrame': body.get('frame_processado'),
             'videoTimeSeconds': body.get('video_time_s'),
-            'modelSha256': model.get('sha256', '')
+            'modelSha256': model.get('sha256', ''),
+            'detectedClass': detected_class
         }
     }
     evidencia = body.get('evidence') or body.get('evidencia')

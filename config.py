@@ -26,6 +26,8 @@ class Config:
     imgsz: int = int(os.getenv('IMGSZ', '640'))
     risk_class: str = os.getenv('RISK_CLASS', 'pessoa_queda')
     normal_class: str = os.getenv('NORMAL_CLASS', 'pessoa_normal')
+    desequilibrio_class: str = os.getenv('DESEQUILIBRIO_CLASS', 'pessoa_desequilibrio')
+    log_mode: str = os.getenv('LOG_MODE', 'production').lower()
     frames: int = int(os.getenv('FRAMES_PARA_ALERTA', '8'))
     normal_frames: int = int(os.getenv('FRAMES_NORMAIS_ENCERRAR', '15'))
     cooldown: float = float(os.getenv('COOLDOWN_S', '3'))
@@ -53,6 +55,8 @@ class Config:
     heartbeat_key: str = os.getenv('RABBIT_HEARTBEAT_KEY', 'camera.heartbeat')
 
     def validate(self):
+        if self.log_mode not in {'development', 'production'}:
+            raise ValueError('LOG_MODE deve ser development ou production')
         if self.source_mode not in {'video', 'stream'}:
             raise ValueError('SOURCE_MODE deve ser video ou stream')
         if not self.camera_id or not self.source:

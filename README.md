@@ -54,8 +54,8 @@ A imagem Docker empacota exclusivamente o código Python e suas dependências de
 
 1. **Pastas distintas por versão:** Cada release de pesos deve residir em sua própria pasta (`/opt/poolsafe/modelos/releases/<versao>/best.pt`).
 2. **Imutabilidade em execução:** Nunca sobrescreva o arquivo `best.pt` enquanto o container estiver rodando.
-3. **Identificação por SHA-256:** Na inicialização, o worker calcula e registra nos logs o SHA-256 exato do arquivo carregado e confere as classes esperadas (`pessoa_normal`, `pessoa_queda`).
-4. **Sem necessidade de rebuild:** A troca de pesos compatíveis com as mesmas classes não exige rebuild da imagem Docker — basta alterar a variável `HOST_MODEL_DIR` e o `MODEL_VERSION` no Compose.
+3. **Identificação por SHA-256 e Classes:** Na inicialização, o worker calcula e registra nos logs o SHA-256 exato dos pesos carregados e valida as classes mapeadas. Aceita o modelo novo de três classes (`pessoa_normal`, `pessoa_desequilibrio`, `pessoa_queda`) e preserva compatibilidade com o modelo anterior de duas classes (`pessoa_normal`, `pessoa_queda`). Classes não reconhecidas são rejeitadas com erro identificável (`ERR_MODEL_CLASSES_UNKNOWN`).
+4. **Sem necessidade de rebuild:** A troca de pesos compatíveis com as classes suportadas não exige rebuild da imagem Docker — basta alterar a variável `HOST_MODEL_DIR` e o `MODEL_VERSION` no Compose.
 5. **Ensaios simultâneos:** Devem utilizar diretórios de dados (`HOST_DATA_DIR`) separados para evitar conflito de locks e concorrência no SQLite (`outbox.sqlite3`).
 6. **Recriação obrigatória:** Um simples *restart* do container não aplica novas variáveis de ambiente ou montagens de volume; é necessário recriar o container (no Portainer: *Update the stack* com *Re-pull image* ou recriação do container).
 7. **Rollback:** Para reverter um modelo ou versão de código com problemas, altere `WORKER_IMAGE`, `HOST_MODEL_DIR` e `MODEL_VERSION` de volta para a combinação estável anterior homologada.
@@ -108,9 +108,35 @@ A imagem Docker empacota exclusivamente o código Python e suas dependências de
 
 ## 4. Primeiro Ensaio com Vídeo (Sem Publicação)
 
-O primeiro ensaio deve validar o pipeline de visão computacional em ambiente real sem emitir mensagens ao RabbitMQ nem acionar alertas ao aplicativo móvel.
+## 4. Ensaio com Vídeo (Classes, Severidades e Log Modes)
 
-### Configuração do Ensaio Seguro
+O ensaio valida o pipeline de visão computacional em ambiente real sem emitir mensagens ao RabbitMQ nem acionar alertas ao aplicativo móvel.
+
+### 4.1. Classes do Modelo e Severidades
+
+O worker resolve classes por nome, aceitando o modelo de 3 classes e mantendo compatibilidade com pesos anteriores de 2 classes:
+
+| Classe no Modelo | Tipo do Evento | Severidade | Comportamento Operacional |
+|---|---|---|---|
+| `pessoa_normal` | — | — | Não gera evento; rearma episódios anteriores após 15 frames |
+| `pessoa_desequilibrio` | `POSSIVEL_RISCO` | `ATENCAO` | Produz evento local/outbox; notificação convencional no app (futuro) |
+| `pessoa_queda` | `POSSIVEL_RISCO` | `CRITICA` | Produz evento local/outbox; aciona alarme e sirene de emergência |
+
+### 4.2. Regras de Confirmação Temporal, Escalada e Cooldown
+
+- **Contagens Independentes:** 8 frames consecutivos de desequilíbrio confirmam `ATENCAO`; 8 frames consecutivos de queda confirmam `CRITICA`. Frames de desequilíbrio não somam na contagem de queda.
+- **Escalada de Risco:** Uma confirmação prévia de `ATENCAO` **não bloqueia** uma subsequente confirmação de `CRITICA` no mesmo episódio.
+- **Sem Regressão:** Após uma confirmação `CRITICA`, oscilações para desequilíbrio são suprimidas até que ocorra o rearmamento por frames normais.
+- **Rearmamento e Interrupções:** 15 frames normais rearmam o track. Lacunas temporais (> 0.5s) e ausência de detecção no frame interrompem explicitamente as sequências em andamento.
+- **Cooldown por Severidade:** O cooldown de 3 segundos no nível da câmera é segregado por severidade (`ATENCAO` e `CRITICA`). Um alerta de atenção não impede a emissão imediata de uma queda crítica.
+- **Event Keys Exclusivas:** Cada emissão de atenção e de crítica gera seu próprio `eventKey` único (UUIDv4), mantido de forma estável durante retries da outbox.
+
+### 4.3. Modos de Log (`LOG_MODE`)
+
+- `production` (padrão): Registra somente início/fim, metadados do modelo, eventos confirmados, erros operacionais e resumo final. Não emite linhas de log por frame.
+- `development`: Além dos registros essenciais, gera auditoria estruturada por frame em `/dados/runs/<run_id>/deteccoes.jsonl` com detecções, caixas, contagens temporais, transições e diagnóstico de sobreposições elevadas entre classes distintas.
+
+### 4.4. Configuração Recomendada para o Próximo Ensaio
 
 Defina as variáveis na Stack do Portainer:
 
@@ -124,33 +150,45 @@ HOST_VIDEO_DIR=/opt/poolsafe/entrada
 HOST_DATA_DIR=/opt/poolsafe/dados/ensaio-modelo-001
 MODEL_VERSION=modelo-001
 DEVICE=cpu
+LOG_MODE=development
 TEST_MODE=true
 ALLOW_TEST_PUBLISH=false
 PUBLISH_RABBIT=false
 INCLUDE_EVIDENCE=false
 ```
 
-### O que Conferir nos Logs do Container
+### 4.5. Estrutura de Registros e Resumo do Ensaio
 
-Acesse **Containers -> poolsafe-worker -> Logs** e verifique:
+Os dados gerados pelo ensaio são organizados por `run_id`:
 
-1. **Carregamento do modelo:** Verifique a emissão da linha de log contendo:
-   - `versão=<MODEL_VERSION>`
-   - `sha256=<HASH_SHA256>`
-   - `classes={0: 'pessoa_normal', 1: 'pessoa_queda'}`
-   - `device=cpu`
-2. **Modo e parâmetros operacionais:**
-   - `Modo=video teste=True publicação=False; frames=8 cooldown=3.0s`
-3. **Ausência de publicação e heartbeat:**
-   - Em `SOURCE_MODE=video`, o heartbeat de câmera fica completamente desativado.
-   - Nenhuma conexão AMQP é aberta quando `PUBLISH_RABBIT=false`.
-4. **Detecções e confirmações:**
-   - Eventos locais registrados no log e detalhados em `/dados/deteccoes.jsonl`.
-   - Tempo de processamento por frame e consumo de CPU/memória no container.
-   - Encerramento limpo ao atingir o fim do arquivo de vídeo.
+```text
+/dados/
+├── outbox.sqlite3               # Outbox persistente (não fica em pasta descartável)
+├── servico.log                  # Log cumulativo de serviço
+├── latest_run                   # Arquivo com o run_id da execução mais recente
+└── runs/
+    └── <run_id>/
+        ├── servico.log          # Log operacional isolado da execução
+        ├── resumo.json          # Resumo consolidado com métricas, latências e eventos
+        └── deteccoes.jsonl      # Auditoria frame a frame (em LOG_MODE=development)
+```
 
-> [!NOTE]
-> Este worker não gera arquivos MP4 com caixas anotadas nem salva evidências gráficas no ensaio local se a publicação estiver desligada. Toda auditoria de inferência no ensaio é realizada via logs e pelo arquivo JSONL de detecções.
+Ao encerrar normalmente ou por falha controlada, o worker gera automaticamente o arquivo `resumo.json` contendo tempos de processamento (1º frame, subsequentes, min/médio/máx, FPS efetivo), contagem de eventos por severidade e supressões.
+
+### 4.6. Utilitário de Exportação Markdown (`export_ensaio.py`)
+
+Para inspecionar os resultados sem depender de Python com GPU, OpenCV, YOLO, broker ou câmera:
+
+```bash
+# Gera relatório Markdown da execução mais recente
+python export_ensaio.py --latest
+
+# Gera relatório a partir da pasta de um ensaio específico
+python export_ensaio.py /opt/poolsafe/dados/ensaio-modelo-001/runs/<RUN_ID>
+
+# Exibe o relatório Markdown diretamente no terminal
+python export_ensaio.py --latest --stdout
+```
 
 ---
 
@@ -190,11 +228,12 @@ CODIGO_INTEGRACAO=codigo_cadastrado_na_api
 
 | Arquivo | Função |
 |---|---|
-| `main.py` | Carrega modelo, executa rastreamento YOLO/ByteTrack, gerencia ciclo de vida e encerramento |
-| `config.py` | Validação estrita de tipos e regras das variáveis de ambiente |
+| `main.py` | Ciclo de vida, inferência YOLO/ByteTrack, cálculo de latências, resumo JSON e orquestração |
+| `config.py` | Validação estrita de tipos e regras das variáveis de ambiente (incluindo `LOG_MODE`) |
 | `captura.py` | Gerenciamento de conexão RTSP com reconexão contínua e desacoplamento de frames |
-| `regras.py` | Motor de confirmação temporal de quedas (frames consecutivos, quebra por tempo, cooldown) |
+| `regras.py` | Motor de confirmação temporal multi-classe, validação de classes, escalada e cooldowns |
 | `transporte.py` | Fila local outbox em SQLite e publicação persistente (`publisher confirms`) no RabbitMQ |
+| `export_ensaio.py` | Utilitário CLI independente para geração de relatório Markdown dos ensaios |
 | `Dockerfile` | Definição da imagem de runtime em Python 3.11 com usuário não-root (UID 10001) |
 | `compose.yaml` | Stack única para implantação no Portainer/Docker Compose |
 | `.env.example` | Template de configuração com valores seguros para ensaios |
@@ -211,9 +250,18 @@ Para executar a validação localmente:
 # Validação da sintaxe e compilação dos scripts Python
 python -m compileall -q .
 
-# Execução da suíte de 21 testes unitários isolados
+# Execução da suíte completa de 40 testes unitários isolados
 python -m unittest discover -s tests -v
 
 # Validação do Compose (fornecendo imagem de teste)
 WORKER_IMAGE=ghcr.io/poolsafe/poolsafe_integracao:ci-validate docker compose config
 ```
+
+---
+
+## 8. Limitações e Notas Metodológicas
+
+1. **Escopo do Worker vs. Aplicativo:** O worker classifica e produz eventos com severidade `ATENCAO` e `CRITICA`. A apresentação diferenciada de `ATENCAO` (notificação convencional sem sirene) no aplicativo móvel e nós n8n é pendência posterior das camadas externas.
+2. **Confiança não é Acurácia:** O score emitido pela rede neural reflete a confiança da caixa delimitadora e não deve ser divulgado como acurácia global do sistema. Métricas como precisão, recall e FPR exigem base rotulada independente com ground truth.
+3. **Deduplicação por Câmera:** O cooldown de 3 segundos por severidade é global para a câmera. Se dois indivíduos apresentarem o mesmo nível de risco simultaneamente, o segundo poderá ser suprimido.
+

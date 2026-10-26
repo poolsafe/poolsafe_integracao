@@ -9,8 +9,9 @@ import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from regras import Motor
+from regras import Motor, validate_model_classes, ModelCompatibilityError, resolve_observation, Decisao
 from transporte import Outbox, Publisher
+import export_ensaio
 
 
 class RegrasTest(unittest.TestCase):
@@ -21,7 +22,7 @@ class RegrasTest(unittest.TestCase):
         m = self.motor()
         self.assertEqual(m.update({1: True}, 1, 0), [])
         self.assertEqual(m.update({1: True}, 2, .1), [])
-        self.assertEqual(m.update({1: True}, 3, .2), [(1, 'confirmado')])
+        self.assertEqual(m.update({1: True}, 3, .2), [(1, 'confirmado', 'CRITICA')])
         self.assertEqual(m.update({1: True}, 4, .3), [])
 
     def test_ausencia_quebra_contagem(self):
@@ -355,5 +356,277 @@ class OutboxTest(unittest.TestCase):
             self.assertEqual(b.count(), 0)
 
 
+class ValidacaoModeloTest(unittest.TestCase):
+    def test_modelo_tres_classes_valido(self):
+        names = {0: 'pessoa_desequilibrio', 1: 'pessoa_normal', 2: 'pessoa_queda'}
+        res = validate_model_classes(names)
+        self.assertEqual(len(res), 3)
+        self.assertEqual(res[0], 'pessoa_desequilibrio')
+        self.assertEqual(res[1], 'pessoa_normal')
+        self.assertEqual(res[2], 'pessoa_queda')
+
+    def test_modelo_duas_classes_retrocompativel(self):
+        names = {0: 'pessoa_normal', 1: 'pessoa_queda'}
+        res = validate_model_classes(names)
+        self.assertEqual(len(res), 2)
+        self.assertEqual(res[0], 'pessoa_normal')
+        self.assertEqual(res[1], 'pessoa_queda')
+
+    def test_modelo_classe_obrigatoria_ausente(self):
+        # Falta pessoa_queda
+        with self.assertRaises(ModelCompatibilityError) as ctx:
+            validate_model_classes({0: 'pessoa_normal', 1: 'pessoa_desequilibrio'})
+        self.assertEqual(ctx.exception.code, 'ERR_MODEL_CLASSES_MISSING')
+        self.assertIn('pessoa_queda', ctx.exception.message)
+
+        # Falta pessoa_normal
+        with self.assertRaises(ModelCompatibilityError) as ctx:
+            validate_model_classes({0: 'pessoa_queda'})
+        self.assertEqual(ctx.exception.code, 'ERR_MODEL_CLASSES_MISSING')
+
+    def test_modelo_classe_desconhecida_rejeitada(self):
+        names = {0: 'pessoa_normal', 1: 'pessoa_queda', 2: 'animal'}
+        with self.assertRaises(ModelCompatibilityError) as ctx:
+            validate_model_classes(names)
+        self.assertEqual(ctx.exception.code, 'ERR_MODEL_CLASSES_UNKNOWN')
+        self.assertIn('animal', ctx.exception.message)
+
+    def test_observacao_classe_desconhecida_nao_interpretada_como_normal(self):
+        with self.assertRaises(ModelCompatibilityError) as ctx:
+            resolve_observation('intruso_desconhecido')
+        self.assertEqual(ctx.exception.code, 'ERR_UNKNOWN_CLASS')
+
+
+class RegrasMultiClasseTest(unittest.TestCase):
+    def motor(self, **kw):
+        params = {'frames': 3, 'normal_frames': 2, 'cooldown': 3.0}
+        params.update(kw)
+        return Motor(**params)
+
+    def test_normal_sem_evento(self):
+        m = self.motor()
+        for i in range(15):
+            decisions = m.update({1: 'pessoa_normal'}, i + 1, i * 0.1)
+            self.assertEqual(decisions, [])
+        self.assertEqual(len(m.states), 1)
+        self.assertFalse(m.states[1].active)
+
+    def test_desequilibrio_gerando_somente_atencao(self):
+        m = self.motor()
+        self.assertEqual(m.update({1: 'pessoa_desequilibrio'}, 1, 0.0), [])
+        self.assertEqual(m.update({1: 'pessoa_desequilibrio'}, 2, 0.1), [])
+        d = m.update({1: 'pessoa_desequilibrio'}, 3, 0.2)
+        self.assertEqual(d, [(1, 'confirmado', 'ATENCAO')])
+        # Frames subsequentes de desequilíbrio não repetem o evento
+        self.assertEqual(m.update({1: 'pessoa_desequilibrio'}, 4, 0.3), [])
+
+    def test_queda_gerando_critica(self):
+        m = self.motor()
+        self.assertEqual(m.update({1: 'pessoa_queda'}, 1, 0.0), [])
+        self.assertEqual(m.update({1: 'pessoa_queda'}, 2, 0.1), [])
+        d = m.update({1: 'pessoa_queda'}, 3, 0.2)
+        self.assertEqual(d, [(1, 'confirmado', 'CRITICA')])
+        # Frames subsequentes de queda não repetem
+        self.assertEqual(m.update({1: 'pessoa_queda'}, 4, 0.3), [])
+
+    def test_frames_classes_diferentes_nao_somam_confirmacao(self):
+        m = self.motor(frames=4)
+        # 2 frames de desequilíbrio + 2 frames de queda != 4 frames de queda
+        m.update({1: 'pessoa_desequilibrio'}, 1, 0.0)
+        m.update({1: 'pessoa_desequilibrio'}, 2, 0.1)
+        self.assertEqual(m.states[1].streak_atencao, 2)
+        self.assertEqual(m.states[1].streak_critica, 0)
+
+        # Transição para queda reseta a contagem de atenção e inicia a crítica do zero
+        m.update({1: 'pessoa_queda'}, 3, 0.2)
+        self.assertEqual(m.states[1].streak_atencao, 0)
+        self.assertEqual(m.states[1].streak_critica, 1)
+
+        d = m.update({1: 'pessoa_queda'}, 4, 0.3)
+        self.assertEqual(d, [])  # Apenas 2 frames de queda acumulados, nenhum alerta
+        self.assertEqual(m.states[1].streak_critica, 2)
+
+    def test_atencao_seguida_de_queda_sem_bloqueio_por_cooldown_ou_flag(self):
+        m = self.motor(frames=3, cooldown=3.0)
+        # 3 frames de desequilíbrio -> confirma ATENCAO aos 0.2s
+        m.update({1: 'pessoa_desequilibrio'}, 1, 0.0)
+        m.update({1: 'pessoa_desequilibrio'}, 2, 0.1)
+        d_atencao = m.update({1: 'pessoa_desequilibrio'}, 3, 0.2)
+        self.assertEqual(d_atencao, [(1, 'confirmado', 'ATENCAO')])
+        self.assertTrue(m.states[1].active_atencao)
+        self.assertFalse(m.states[1].active_critica)
+
+        # Queda inicia imediatamente a seguir (aos 0.3s, dentro da janela de cooldown global de 3s)
+        m.update({1: 'pessoa_queda'}, 4, 0.3)
+        m.update({1: 'pessoa_queda'}, 5, 0.4)
+        d_critica = m.update({1: 'pessoa_queda'}, 6, 0.5)
+
+        # CRITICA NÃO pode ser bloqueada pelo cooldown ou pela flag de ATENCAO ativa
+        self.assertEqual(d_critica, [(1, 'confirmado', 'CRITICA')])
+        self.assertTrue(m.states[1].active_critica)
+
+    def test_critica_sem_regressao_para_nova_atencao_no_mesmo_episodio(self):
+        m = self.motor(frames=3)
+        # 3 frames de queda -> confirma CRITICA
+        for i in range(3):
+            m.update({1: 'pessoa_queda'}, i + 1, i * 0.1)
+        self.assertTrue(m.states[1].active_critica)
+
+        # Oscilação para desequilíbrio não deve emitir ATENCAO após CRITICA antes de rearmar
+        for i in range(5):
+            d = m.update({1: 'pessoa_desequilibrio'}, i + 4, (i + 4) * 0.1)
+            self.assertEqual(d, [])
+
+    def test_rearmamento_por_frames_normais(self):
+        m = self.motor(frames=3, normal_frames=2)
+        # Emite crítica
+        for i in range(3):
+            m.update({1: 'pessoa_queda'}, i + 1, i * 0.1)
+        self.assertTrue(m.states[1].active_critica)
+
+        # 2 frames normais rearmam o track
+        m.update({1: 'pessoa_normal'}, 4, 0.3)
+        self.assertTrue(m.states[1].active_critica)
+        m.update({1: 'pessoa_normal'}, 5, 0.4)
+        self.assertFalse(m.states[1].active_critica)
+        self.assertFalse(m.states[1].active_atencao)
+
+        # Após rearmar e esperar término do cooldown da severidade (3s), novo evento pode ser emitido
+        for i in range(2):
+            m.update({1: 'pessoa_desequilibrio'}, i + 6, 4.0 + i * 0.1)
+        d_novo = m.update({1: 'pessoa_desequilibrio'}, 8, 4.2)
+        self.assertEqual(d_novo, [(1, 'confirmado', 'ATENCAO')])
+
+    def test_interrupcao_por_lacuna_tempo_e_ausencia(self):
+        m = self.motor(frames=3, max_gap=0.5)
+        # 2 frames de desequilíbrio
+        m.update({1: 'pessoa_desequilibrio'}, 1, 0.0)
+        m.update({1: 'pessoa_desequilibrio'}, 2, 0.1)
+
+        # Lacuna de tempo (> max_gap de 0.5s) quebra a sequência
+        m.update({1: 'pessoa_desequilibrio'}, 3, 1.0)
+        self.assertEqual(m.states[1].streak_atencao, 1)
+
+        # 2 frames de queda
+        m.update({1: 'pessoa_queda'}, 4, 1.1)
+        m.update({1: 'pessoa_queda'}, 5, 1.2)
+        self.assertEqual(m.states[1].streak_critica, 2)
+
+        # Ausência do ID no frame 6 quebra a sequência de queda
+        m.update({}, 6, 1.3)
+        self.assertEqual(m.states[1].streak_critica, 0)
+        m.update({1: 'pessoa_queda'}, 7, 1.4)
+        self.assertEqual(m.states[1].streak_critica, 1)
+
+    def test_perda_de_id_apos_lost_reset(self):
+        m = self.motor(lost_reset=2.0)
+        m.update({1: 'pessoa_normal'}, 1, 0.0)
+        self.assertIn(1, m.states)
+
+        # Mais de 2.0s sem observação purga o ID
+        m.update({}, 2, 3.0)
+        self.assertNotIn(1, m.states)
+
+    def test_cooldown_separado_por_severidade_outro_id(self):
+        m = self.motor(frames=3, cooldown=3.0)
+        # Track 1 confirma ATENCAO aos 0.2s
+        for i in range(3):
+            m.update({1: 'pessoa_desequilibrio'}, i + 1, i * 0.1)
+
+        # Track 2 atinge 3 frames de ATENCAO aos 1.2s -> suprimido pelo cooldown de ATENCAO
+        m.update({2: 'pessoa_desequilibrio'}, 10, 1.0)
+        m.update({2: 'pessoa_desequilibrio'}, 11, 1.1)
+        d2_atencao = m.update({2: 'pessoa_desequilibrio'}, 12, 1.2)
+        self.assertEqual(d2_atencao, [(2, 'suprimido_cooldown', 'ATENCAO')])
+
+        # Track 2 transiciona para queda e completa 3 frames de CRITICA aos 1.5s
+        m.update({2: 'pessoa_queda'}, 13, 1.3)
+        m.update({2: 'pessoa_queda'}, 14, 1.4)
+        d2_critica = m.update({2: 'pessoa_queda'}, 15, 1.5)
+        # CRITICA confirma porque o cooldown de CRITICA é independente e nunca foi acionado
+        self.assertEqual(d2_critica, [(2, 'confirmado', 'CRITICA')])
+
+
+class ExportEnsaioTest(unittest.TestCase):
+    def test_geracao_relatorio_markdown_e_redacao_credenciais(self):
+        sample_data = {
+            'run_id': 'run-teste-123',
+            'inicio': '2026-10-25T20:00:00.000Z',
+            'fim': '2026-10-25T20:00:10.000Z',
+            'motivo_encerramento': 'fim_esperado_video',
+            'detalhe_encerramento': 'Todos os 300 frames lidos',
+            'log_mode': 'development',
+            'source_mode': 'stream',
+            'source': 'rtsp://admin:super_secret_pass@192.168.1.100:554/live',
+            'revisao_codigo': 'abc123commit',
+            'configuracao_efetiva': {
+                'camera_id': 'cam_01',
+                'device': 'cpu',
+                'frames_para_alerta': 8,
+                'cooldown_s': 3.0,
+                'test_mode': True,
+                'publish_rabbit': False
+            },
+            'modelo': {
+                'versao': 'modelo-003',
+                'sha256': 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+                'classes': {0: 'pessoa_desequilibrio', 1: 'pessoa_normal', 2: 'pessoa_queda'}
+            },
+            'processamento': {
+                'frames_processados': 300,
+                'duracao_total_s': 10.0,
+                'fps_efetivo': 30.0,
+                'tempo_primeiro_frame_s': 0.12,
+                'tempo_medio_frames_subsequentes_s': 0.033,
+                'tempo_min_frame_s': 0.025,
+                'tempo_medio_frame_s': 0.033,
+                'tempo_max_frame_s': 0.12
+            },
+            'eventos': {
+                'confirmados_por_severidade': {'ATENCAO': 1, 'CRITICA': 1},
+                'suprimidos_por_severidade': {'ATENCAO': 0, 'CRITICA': 0},
+                'lista_eventos': [
+                    {
+                        'eventKey': 'uuid-atencao',
+                        'severity': 'ATENCAO',
+                        'classe': 'pessoa_desequilibrio',
+                        'track_id': 5,
+                        'frame_processado': 50,
+                        'video_time_s': 1.66,
+                        'detectedAt': '2026-10-25T20:00:02.000Z',
+                        'confidence': 0.85
+                    },
+                    {
+                        'eventKey': 'uuid-critica',
+                        'severity': 'CRITICA',
+                        'classe': 'pessoa_queda',
+                        'track_id': 5,
+                        'frame_processado': 60,
+                        'video_time_s': 2.0,
+                        'detectedAt': '2026-10-25T20:00:03.000Z',
+                        'confidence': 0.92
+                    }
+                ]
+            },
+            'outbox': {
+                'pendencias_finais': 0
+            }
+        }
+        md = export_ensaio.generate_markdown(sample_data)
+        # Credencial de câmera DEVE ser mascarada
+        self.assertNotIn('super_secret_pass', md)
+        self.assertIn('rtsp://admin:***@192.168.1.100:554/live', md)
+        # Eventos por severidade presentes
+        self.assertIn('ATENCAO', md)
+        self.assertIn('CRITICA', md)
+        self.assertIn('uuid-atencao', md)
+        self.assertIn('uuid-critica', md)
+        # Metadados essenciais
+        self.assertIn('run-teste-123', md)
+        self.assertIn('fim_esperado_video', md)
+        self.assertIn('30.0 FPS', md)
+
+
 if __name__ == '__main__':
     unittest.main()
+
