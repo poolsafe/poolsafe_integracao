@@ -14,6 +14,7 @@ import threading
 import time
 from pathlib import Path
 from contextlib import contextmanager
+from observabilidade import log_event, reference
 
 log = logging.getLogger(__name__)
 
@@ -194,12 +195,15 @@ class Publisher(threading.Thread):
         if expiration_ms is not None:
             props['expiration'] = expiration_ms
 
+        publish_started = time.perf_counter()
         self.channel.basic_publish(
             exchange=self.cfg.exchange,
             routing_key=self.cfg.alert_key if risk else self.cfg.heartbeat_key,
             body=json.dumps(body, ensure_ascii=False).encode(),
             mandatory=True,
             properties=pika.BasicProperties(**props))
+        log_event(log, 'amqp.publish_confirmed', event_ref=reference(event_key), risk=risk,
+                  publish_ms=round((time.perf_counter()-publish_started)*1000, 3))
         return True
 
     def close_connection(self):
@@ -258,7 +262,8 @@ class Publisher(threading.Thread):
                             self.main_stopping.set()
                         break
                     # Falhas transitórias (rede, timeout, queda de conexão): segue fluxo de reconexão
-                    log.error('Publicação falhou: %s; pendentes preservados', exc_name)
+                    log_event(log, 'amqp.publish_failure', level=logging.ERROR, error_type=exc_name,
+                              pending_preserved=True)
                     self.close_connection()
                     self.stop_event.wait(3)
         except Exception as unhandled:

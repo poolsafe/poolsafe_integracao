@@ -114,3 +114,9 @@ A **API Node.js é a autoridade de negócio**:
 - O campo `technicalData.test` é informativo e não impede processamento pela API.
 - Para publicar no RabbitMQ em modo de teste, é mandatória a liberação explícita `ALLOW_TEST_PUBLISH=true`. Sem ela, o serviço falha imediatamente na inicialização.
 - Ambientes de teste devem utilizar câmeras de teste com `CODIGO_INTEGRACAO` específico e workflows n8n com destinatários controlados.
+
+## Perfil desta entrega V4
+
+Os envelopes acima e a topologia permanecem existentes. O worker já suportava emissão ATENCAO, mas o contrato base de risco acima especifica CRITICA: confirmar suporte do consumidor antes de habilitar atenção, ou usar EMIT_ATTENTION=false. Não foram acrescentados campos V4 ao envelope externo.
+
+Conforme a fonte da verdade de 21/10, n8n→API usa X-Internal-Service-Key em credencial Header Auth na rede privada; essa chave não é configuração do Python. O aceite é transacional na API no momento do processamento, não retroativo por detectedAt. O tratamento real de consumo/reentrega/DLQ permanece responsabilidade do workflow, sem implantação nesta entrega.

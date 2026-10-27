@@ -9,7 +9,19 @@ services:
   poolsafe:
     image: ${WORKER_IMAGE:?Defina WORKER_IMAGE}
     container_name: ${CONTAINER_NAME:-poolsafe-worker}
-    restart: "no" # Para primeiro ensaio; alterar para unless-stopped após homologação
+    restart: "${WORKER_RESTART:-no}"
+    cpus: "${WORKER_CPUS:-2}"
+    mem_limit: ${WORKER_MEMORY:-3g}
+    pids_limit: 256
+    shm_size: 256m
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
     stop_grace_period: 45s
     init: true
     logging:
@@ -25,19 +37,42 @@ services:
       MODEL_PATH: /modelos/best.pt
       MODEL_VERSION: ${MODEL_VERSION:-candidato}
       DEVICE: ${DEVICE:-cpu}
+      ENGINE_VERSION: ${ENGINE_VERSION:-v4}
+      ENGINE_FPS: ${ENGINE_FPS:-15}
+      CONF_NORMAL: ${CONF_NORMAL:-0.30}
+      CONF_DESEQUILIBRIO: ${CONF_DESEQUILIBRIO:-0.65}
+      CONF_QUEDA: ${CONF_QUEDA:-0.50}
+      FRAMES_DESEQUILIBRIO: ${FRAMES_DESEQUILIBRIO:-15}
+      EVIDENCIAS_QUEDA: ${EVIDENCIAS_QUEDA:-10}
+      TOLERANCIA_QUEDA_FRAMES: ${TOLERANCIA_QUEDA_FRAMES:-1}
+      DEDUP_IOU: ${DEDUP_IOU:-0.50}
+      DEDUP_INTERVALO_S: ${DEDUP_INTERVALO_S:-1.5}
+      HANDOFF_ENABLED: ${HANDOFF_ENABLED:-true}
+      HANDOFF_IOU: ${HANDOFF_IOU:-0.70}
+      HANDOFF_INTERVALO_S: ${HANDOFF_INTERVALO_S:-0.30}
+      EMIT_ATTENTION: ${EMIT_ATTENTION:-true}
+      TORCH_THREADS: ${TORCH_THREADS:-2}
+      TORCH_INTEROP_THREADS: ${TORCH_INTEROP_THREADS:-1}
+      OPENCV_THREADS: ${OPENCV_THREADS:-1}
+      METRICS_WINDOW: ${METRICS_WINDOW:-1024}
+      METRICS_INTERVAL_S: ${METRICS_INTERVAL_S:-15}
+      HEALTH_STALE_S: ${HEALTH_STALE_S:-90}
+      V4_LOG_EVERY_N_FRAMES: ${V4_LOG_EVERY_N_FRAMES:-150}
+      SHUTDOWN_DRAIN_S: ${SHUTDOWN_DRAIN_S:-15}
+      MODEL_SHA256: ${MODEL_SHA256:-}
+      OMP_NUM_THREADS: ${TORCH_THREADS:-2}
+      MKL_NUM_THREADS: ${TORCH_THREADS:-2}
+      OPENBLAS_NUM_THREADS: ${TORCH_THREADS:-2}
       LOG_MODE: ${LOG_MODE:-production}
       TEST_MODE: ${TEST_MODE:-true}
       ALLOW_TEST_PUBLISH: ${ALLOW_TEST_PUBLISH:-false}
       PUBLISH_RABBIT: ${PUBLISH_RABBIT:-false}
       INCLUDE_EVIDENCE: ${INCLUDE_EVIDENCE:-false}
-      CONF: ${CONF:-0.25}
       IOU: ${IOU:-0.70}
       IMGSZ: ${IMGSZ:-640}
-      FRAMES_PARA_ALERTA: ${FRAMES_PARA_ALERTA:-8}
       FRAMES_NORMAIS_ENCERRAR: ${FRAMES_NORMAIS_ENCERRAR:-15}
       COOLDOWN_S: ${COOLDOWN_S:-3}
       MAX_INTERVALO_S: ${MAX_INTERVALO_S:-0.5}
-      LOST_RESET_S: ${LOST_RESET_S:-2}
       HEARTBEAT_INTERVAL_S: ${HEARTBEAT_INTERVAL_S:-30}
       HEARTBEAT_TTL_S: ${HEARTBEAT_TTL_S:-60}
       ALERT_TTL_S: ${ALERT_TTL_S:-0}

@@ -1,5 +1,6 @@
 """Configuração por ambiente: nenhum endereço ou segredo real pertence ao código."""
 import os
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,19 +21,38 @@ class Config:
     source: str = os.getenv('SOURCE', '/entrada/teste.mp4')
     model_path: str = os.getenv('MODEL_PATH', '/modelos/best.pt')
     model_version: str = os.getenv('MODEL_VERSION', 'candidato')
+    model_sha256: str = os.getenv('MODEL_SHA256', '')
     device: str = os.getenv('DEVICE', 'cpu')
-    conf: float = float(os.getenv('CONF', '0.25'))
+    engine_version: str = os.getenv('ENGINE_VERSION', 'v4')
+    engine_fps: float = float(os.getenv('ENGINE_FPS', '15'))
+    torch_threads: int = int(os.getenv('TORCH_THREADS', '2'))
+    torch_interop_threads: int = int(os.getenv('TORCH_INTEROP_THREADS', '1'))
+    opencv_threads: int = int(os.getenv('OPENCV_THREADS', '1'))
+    metrics_window: int = int(os.getenv('METRICS_WINDOW', '1024'))
+    metrics_interval: float = float(os.getenv('METRICS_INTERVAL_S', '15'))
+    health_stale: float = float(os.getenv('HEALTH_STALE_S', '90'))
+    v4_log_every: int = int(os.getenv('V4_LOG_EVERY_N_FRAMES', '150'))
+    conf_normal: float = float(os.getenv('CONF_NORMAL', '0.30'))
+    conf_desequilibrio: float = float(os.getenv('CONF_DESEQUILIBRIO', '0.65'))
+    conf_queda: float = float(os.getenv('CONF_QUEDA', '0.50'))
+    frames_desequilibrio: int = int(os.getenv('FRAMES_DESEQUILIBRIO', '15'))
+    frames_queda: int = int(os.getenv('EVIDENCIAS_QUEDA', '10'))
+    fall_tolerance: int = int(os.getenv('TOLERANCIA_QUEDA_FRAMES', '1'))
+    dedup_iou: float = float(os.getenv('DEDUP_IOU', '0.50'))
+    dedup_interval: float = float(os.getenv('DEDUP_INTERVALO_S', '1.5'))
+    handoff: bool = flag('HANDOFF_ENABLED', True)
+    handoff_iou: float = float(os.getenv('HANDOFF_IOU', '0.70'))
+    handoff_interval: float = float(os.getenv('HANDOFF_INTERVALO_S', '0.30'))
+    emit_attention: bool = flag('EMIT_ATTENTION', True)
     iou: float = float(os.getenv('IOU', '0.70'))
     imgsz: int = int(os.getenv('IMGSZ', '640'))
     risk_class: str = os.getenv('RISK_CLASS', 'pessoa_queda')
     normal_class: str = os.getenv('NORMAL_CLASS', 'pessoa_normal')
     desequilibrio_class: str = os.getenv('DESEQUILIBRIO_CLASS', 'pessoa_desequilibrio')
     log_mode: str = os.getenv('LOG_MODE', 'production').lower()
-    frames: int = int(os.getenv('FRAMES_PARA_ALERTA', '8'))
     normal_frames: int = int(os.getenv('FRAMES_NORMAIS_ENCERRAR', '15'))
     cooldown: float = float(os.getenv('COOLDOWN_S', '3'))
     max_gap: float = float(os.getenv('MAX_INTERVALO_S', '0.5'))
-    lost_reset: float = float(os.getenv('LOST_RESET_S', '2'))
     heartbeat_interval: float = float(os.getenv('HEARTBEAT_INTERVAL_S', '30'))
     heartbeat_ttl: float = float(os.getenv('HEARTBEAT_TTL_S', '60'))
     alert_ttl: float = float(os.getenv('ALERT_TTL_S', '0'))
@@ -54,7 +74,33 @@ class Config:
     alert_key: str = os.getenv('RABBIT_ALERT_KEY', 'risk.detected')
     heartbeat_key: str = os.getenv('RABBIT_HEARTBEAT_KEY', 'camera.heartbeat')
 
+    @property
+    def inference_conf(self):
+        return min(self.conf_normal, self.conf_desequilibrio, self.conf_queda)
+
+    def engine_policy(self):
+        return {
+            'engine_version': 'v4',
+            'confidencias': {'pessoa_normal': self.conf_normal, 'pessoa_desequilibrio': self.conf_desequilibrio, 'pessoa_queda': self.conf_queda},
+            'frames_desequilibrio': self.frames_desequilibrio,
+            'evidencias_queda': self.frames_queda, 'tolerancia_queda_frames': self.fall_tolerance,
+            'normal_frames': self.normal_frames, 'cooldown_s': self.cooldown,
+            'cooldown_policy': 'camera_aberturas_reavaliadas_elevacao_livre',
+            'dedup_iou': self.dedup_iou, 'dedup_intervalo_s': self.dedup_interval,
+            'handoff': self.handoff, 'handoff_iou': self.handoff_iou,
+            'handoff_intervalo_s': self.handoff_interval, 'engine_fps': self.engine_fps,
+            'stream_sampling': 'latest_decoded_frame',
+            'emit_attention': self.emit_attention,
+        }
+
     def validate(self):
+        if self.engine_version != 'v4':
+            raise ValueError('Somente ENGINE_VERSION=v4 é suportado')
+        if min(self.torch_threads, self.torch_interop_threads, self.metrics_window, self.v4_log_every) < 1 or self.opencv_threads < 0:
+            raise ValueError('Parâmetros de recursos inválidos')
+        for value in (self.engine_fps, self.metrics_interval, self.health_stale, self.max_gap):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError('Intervalos de execução inválidos')
         if self.log_mode not in {'development', 'production'}:
             raise ValueError('LOG_MODE deve ser development ou production')
         if self.source_mode not in {'video', 'stream'}:
@@ -65,13 +111,15 @@ class Config:
             raise ValueError('MODEL_PATH não aponta para arquivo existente')
         if self.source_mode == 'video' and not Path(self.source).is_file():
             raise ValueError('Vídeo SOURCE inexistente dentro do contêiner')
-        if not 0 < self.conf <= 1 or not 0 < self.iou <= 1:
-            raise ValueError('CONF e IOU devem estar entre 0 e 1')
-        if min(self.frames, self.normal_frames, self.imgsz, self.max_pending) < 1:
+        if not math.isfinite(self.iou) or not 0 < self.iou <= 1:
+            raise ValueError('IOU deve estar entre 0 e 1')
+        if self.model_sha256 and (len(self.model_sha256) != 64 or any(x not in '0123456789abcdef' for x in self.model_sha256.lower())):
+            raise ValueError('MODEL_SHA256 inválido')
+        if min(self.imgsz, self.max_pending) < 1:
             raise ValueError('Contagens e resolução precisam ser positivas')
         if self.alert_ttl < 0:
             raise ValueError('ALERT_TTL_S deve ser maior ou igual a zero')
-        if min(self.max_gap, self.lost_reset, self.heartbeat_interval,
+        if min(self.max_gap, self.heartbeat_interval,
                self.heartbeat_ttl, self.drain_seconds) <= 0 or self.cooldown < 0:
             raise ValueError('Intervalos inválidos')
         if self.heartbeat_interval >= self.heartbeat_ttl:

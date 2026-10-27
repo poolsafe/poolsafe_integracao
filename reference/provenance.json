@@ -1,0 +1,9 @@
+{
+  "source": "poolsafe_validacao_episodios_v4_continuidade.py",
+  "sha256": "77f9fa037800f87b2ee79cdec1298a543e5b0e5dde17cd3589d8693a3778fd64",
+  "classes": [
+    "MotorTemporal",
+    "MotorTemporalContinuo"
+  ],
+  "extraction": "AST; classes preservadas, sem executar instalacao, upload ou celulas Colab"
+}

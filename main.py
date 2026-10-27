@@ -20,8 +20,10 @@ from typing import Optional, Dict, Any, List
 
 from captura import StreamReader, utc_now
 from config import Config
-from regras import Motor, validate_model_classes, ModelCompatibilityError, Decisao
+from engine_adapter import MotorV4, validate_model_classes, ModelCompatibilityError, V4Error, detections_from_result
 from transporte import Outbox, Publisher
+from observabilidade import JsonFormatter, Observer, log_event, reference
+from runtime_support import configure_runtime, synchronize_device
 
 log = logging.getLogger('poolsafe')
 
@@ -54,23 +56,6 @@ def get_git_revision() -> Optional[str]:
     except Exception:
         pass
     return None
-
-
-def compute_iou(b1: List[float], b2: List[float]) -> float:
-    """Calcula a interseção sobre união (IoU) entre duas bounding boxes [x1, y1, x2, y2]."""
-    ix1 = max(b1[0], b2[0])
-    iy1 = max(b1[1], b2[1])
-    ix2 = min(b1[2], b2[2])
-    iy2 = min(b1[3], b2[3])
-    iw = max(0.0, ix2 - ix1)
-    ih = max(0.0, iy2 - iy1)
-    intersection = iw * ih
-    if intersection <= 0:
-        return 0.0
-    area1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
-    area2 = (b2[2] - b2[0]) * (b2[3] - b2[1])
-    union = area1 + area2 - intersection
-    return intersection / union if union > 0 else 0.0
 
 
 def prepare_evidence(frame, max_dim=640, quality=70, max_bytes=250_000):
@@ -110,16 +95,19 @@ def setup_logs(directory: Path, run_dir: Path, log_mode: str):
     """
     directory.mkdir(parents=True, exist_ok=True)
     run_dir.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    formatter = JsonFormatter()
+    logging.basicConfig(level=logging.INFO)
+    for handler in logging.getLogger().handlers:
+        handler.setFormatter(formatter)
 
     # Log cumulativo no diretório geral de dados
     service_handler = RotatingFileHandler(directory / 'servico.log', maxBytes=5_000_000, backupCount=5, encoding='utf-8')
-    service_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+    service_handler.setFormatter(formatter)
     logging.getLogger().addHandler(service_handler)
 
     # Log específico desta execução isolada
     run_handler = RotatingFileHandler(run_dir / 'servico.log', maxBytes=5_000_000, backupCount=2, encoding='utf-8')
-    run_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+    run_handler.setFormatter(formatter)
     logging.getLogger().addHandler(run_handler)
 
     logging.getLogger('pika').setLevel(logging.WARNING)
@@ -131,6 +119,7 @@ def setup_logs(directory: Path, run_dir: Path, log_mode: str):
         audit.setLevel(logging.INFO)
         audit.propagate = False
         audit_handler = RotatingFileHandler(run_dir / 'deteccoes.jsonl', maxBytes=10_000_000, backupCount=5, encoding='utf-8')
+        audit_handler.setFormatter(formatter)
         audit.addHandler(audit_handler)
         handlers.append(audit_handler)
 
@@ -147,8 +136,8 @@ def close_logs(handlers):
             pass
 
 
-def new_motor(c):
-    return Motor(c.frames, c.normal_frames, c.cooldown, c.max_gap, c.lost_reset)
+def new_motor(c, fps=None):
+    return MotorV4(c, fps=fps)
 
 
 def main():
@@ -179,7 +168,9 @@ def main():
 
     eventos_por_severidade = {'ATENCAO': 0, 'CRITICA': 0}
     supressoes_por_severidade = {'ATENCAO': 0, 'CRITICA': 0}
-    local_events_summary = []
+    from collections import deque
+    local_events_summary = deque(maxlen=1000)
+    observer = Observer(c, run_id)
 
     total_proc_time = 0.0
     min_frame_proc_time = None
@@ -191,19 +182,21 @@ def main():
     try:
         # Bibliotecas pesadas carregadas só em runtime
         import cv2
+        import torch
         from ultralytics import YOLO
-
-        model = YOLO(c.model_path)
-        raw_names = {int(k): str(v).strip().lower() for k, v in model.names.items()}
-        names = validate_model_classes(raw_names)
+        configure_runtime(c, cv2, torch)
 
         with open(c.model_path, 'rb') as weights:
             sha = hashlib.file_digest(weights, 'sha256').hexdigest()
+        if c.model_sha256 and sha != c.model_sha256.lower():
+            raise ValueError('MODEL_SHA256 não corresponde aos pesos montados')
+        model = YOLO(c.model_path)
+        names = validate_model_classes(model.names)
 
         log.info('Execução iniciada run_id=%s log_mode=%s', run_id, c.log_mode)
         log.info('Modelo versão=%s sha256=%s classes=%s device=%s', c.model_version, sha, names, c.device)
-        log.info('Modo=%s teste=%s publicação=%s; frames=%s cooldown=%ss',
-                 c.source_mode, c.test, c.publish, c.frames, c.cooldown)
+        log.info('Modo=%s teste=%s publicação=%s politica_motor=%s',
+                 c.source_mode, c.test, c.publish, c.engine_policy())
 
         if c.source_mode == 'video' and not c.test:
             raise ValueError('Vídeo gravado exige TEST_MODE=true para não se passar por evento real')
@@ -211,11 +204,11 @@ def main():
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: stopping.set())
 
+        motor = new_motor(c)
         publisher = Publisher(c, outbox, stopping=stopping) if c.publish else None
         if publisher:
             publisher.start()
 
-        motor = new_motor(c)
         generation = 0
         hb_last = float('-inf')
         hb_lock = threading.Lock()
@@ -224,6 +217,7 @@ def main():
 
         def on_stream_frame(observed_iso, observed_epoch):
             nonlocal hb_last
+            observer.captured()
             with hb_lock:
                 if observed_epoch - hb_last < c.heartbeat_interval:
                     return
@@ -268,7 +262,12 @@ def main():
                 exit_reason = 'fps_invalido_video'
                 raise ValueError('FPS inválido: recodifique o vídeo com taxa conhecida')
 
+        if c.source_mode == 'video':
+            motor = new_motor(c, fps=video_fps)
+        observer.flush(outbox, force=True)
+
         while not stopping.is_set():
+            observer.flush(outbox)
             if publisher and publisher.fatal_error:
                 exit_reason = 'erro_fatal_publicador'
                 exit_detail = str(publisher.fatal_error)
@@ -317,59 +316,50 @@ def main():
                 logical_time = video_time
                 observed = format_utc_iso()  # Instante de reprodução UTC com Z
                 capture_sequence = frame_number + 1
+                observer.captured()
 
             frame_number += 1
             process_start = time.monotonic()
+            frame_age_s = max(0.0, process_start-captured_mono) if reader else 0.0
+            synchronize_device(c, torch)
+            inference_started = time.perf_counter()
 
             result = model.track(frame, persist=True, tracker='bytetrack.yaml',
-                                 conf=c.conf, iou=c.iou, imgsz=c.imgsz,
+                                 conf=c.inference_conf, iou=c.iou, imgsz=c.imgsz,
                                  device=c.device, verbose=False)[0]
 
-            observations, selected, detections = {}, {}, []
-            boxes = result.boxes
-            if boxes is not None and len(boxes):
-                xyxy = boxes.xyxy.cpu().tolist()
-                classes = boxes.cls.cpu().tolist()
-                scores = boxes.conf.cpu().tolist()
-                ids = boxes.id.cpu().tolist() if boxes.id is not None else [None] * len(boxes)
+            synchronize_device(c, torch)
+            inference_s = time.perf_counter()-inference_started
+            try:
+                detections = detections_from_result(result, names)
+            except V4Error as exc:
+                log_event(log, 'v4.failure', level=logging.ERROR, run_ref=reference(run_id),
+                          frame=frame_number, segment=generation, error_code=exc.code,
+                          error_type=type(exc).__name__)
+                raise
+            observations = {d['track_id']: d['classe'] for d in detections if d['track_id'] is not None}
 
-                for bounds, cls, score, tid in zip(xyxy, classes, scores, ids):
-                    label = names[int(cls)]
-                    tid = int(tid) if tid is not None else None
-                    d = {
-                        'track_id': tid,
-                        'classe': label,
-                        'confianca': float(score),
-                        'bbox_xyxy': [round(v, 2) for v in bounds]
-                    }
-                    detections.append(d)
-                    if tid is None:
-                        continue  # Auditado, mas não confirma por tracking
-                    if tid not in selected or score > selected[tid]['confianca']:
-                        selected[tid] = d
-                        # Registra o nome da classe observada
-                        observations[tid] = label
-
-            # Verificação diagnóstica de sobreposição alta entre classes distintas (apenas em development)
-            overlaps = []
-            if c.log_mode == 'development' and len(detections) > 1:
-                for i in range(len(detections)):
-                    for j in range(i + 1, len(detections)):
-                        d1, d2 = detections[i], detections[j]
-                        if d1['classe'] != d2['classe']:
-                            iou_val = compute_iou(d1['bbox_xyxy'], d2['bbox_xyxy'])
-                            if iou_val >= 0.70:
-                                overlaps.append({
-                                    'track_id_1': d1['track_id'],
-                                    'classe_1': d1['classe'],
-                                    'track_id_2': d2['track_id'],
-                                    'classe_2': d2['classe'],
-                                    'iou': round(iou_val, 3),
-                                    'bbox_1': d1['bbox_xyxy'],
-                                    'bbox_2': d2['bbox_xyxy']
-                                })
-
-            decisions = motor.update(observations, frame_number, logical_time)
+            trace_validation = c.log_mode == 'development' or frame_number % c.v4_log_every == 0
+            if trace_validation and c.source_mode == 'stream' and motor.last_time is not None and logical_time-motor.last_time > c.max_gap:
+                log_event(log, 'v4.sampling_gap', level=logging.WARNING,
+                          gap_s=round(logical_time-motor.last_time, 3), frame=frame_number)
+            if trace_validation:
+                log_event(log, 'v4.request', run_ref=reference(run_id), frame=frame_number,
+                          detections=len(detections), segment=generation)
+            try:
+                decisions = motor.update_detections(detections, frame_number, logical_time)
+            except V4Error as exc:
+                log_event(log, 'v4.failure', level=logging.ERROR, run_ref=reference(run_id),
+                          frame=frame_number, segment=generation, error_code=exc.code,
+                          error_type=type(exc).__name__, engine_ms=round(motor.duration_s*1000, 3))
+                raise
+            if trace_validation or decisions:
+                log_event(log, 'v4.response', run_ref=reference(run_id), frame=frame_number,
+                          engine_ms=round(motor.duration_s*1000, 3), rows=len(motor.rows),
+                          emitted=sum(d.status == 'confirmado' for d in decisions),
+                          transitions=len(motor.transitions), handoffs=len(motor.continuity))
+            if motor.continuity:
+                log_event(log, 'v4.handoff', frame=frame_number, transfers=len(motor.continuity))
             frame_proc_time = time.monotonic() - process_start
 
             # Agregação de latências sem manter medições infinitas em memória
@@ -405,9 +395,10 @@ def main():
                         {'track_id': d.track_id, 'status': d.status, 'severity': d.severity}
                         for d in decisions
                     ],
-                    'sobreposicoes_classes_distintas': overlaps
+                    'motor_v4': {'linhas': motor.rows, 'transicoes': motor.transitions, 'continuidade': motor.continuity} if c.engine_version == 'v4' else None,
+                    'engine_version': 'v4'
                 }
-                audit.info(json.dumps(audit_record, ensure_ascii=False))
+                audit.info('v4.frame', extra={'event_name': 'v4.frame', 'fields': audit_record})
 
             # Processamento de decisões de risco
             for d in decisions:
@@ -428,8 +419,9 @@ def main():
                 else:
                     expires = 0.0
 
-                confirmed_class = selected[tid]['classe']
-                confirmed_conf = round(float(selected[tid]['confianca']), 4)
+                engine_event = getattr(d, 'event', None)
+                confirmed_class = engine_event['classe_origem']
+                confirmed_conf = round(float(engine_event['confidence']), 4)
 
                 event = {
                     'schemaVersion': '1',
@@ -464,8 +456,12 @@ def main():
                 log.info('Evento local=%s severity=%s classe=%s cameraCode=%s track=%s video_time=%s publicação=%s',
                          event_key, severity, confirmed_class, camera_code, tid, video_time, c.publish)
 
-                local_events_summary.append({
-                    'eventKey': event_key,
+                log_event(log, 'risk.event', event_ref=reference(event_key), run_ref=reference(run_id),
+                          frame=frame_number, severity=severity, engine='v4',
+                          event_kind=engine_event['tipo_evento'],
+                          evidence_count=len(engine_event.get('frames_evidencias', [])))
+                summary_event = {
+                    'event_ref': reference(event_key),
                     'severity': severity,
                     'classe': confirmed_class,
                     'track_id': tid,
@@ -473,7 +469,14 @@ def main():
                     'video_time_s': round(video_time, 4) if video_time is not None else None,
                     'detectedAt': observed,
                     'confidence': confirmed_conf
-                })
+                }
+                with (run_dir / 'eventos.jsonl').open('a', encoding='utf-8') as event_log:
+                    event_log.write(json.dumps(summary_event, ensure_ascii=False) + '\n')
+                local_events_summary.append(summary_event)
+
+
+            observer.completed(capture_sequence, inference_s, motor.duration_s,
+                               time.monotonic()-process_start, frame_age_s)
 
     except ModelCompatibilityError as exc:
         exit_reason = f'erro_compatibilidade_modelo_{exc.code}'
@@ -501,6 +504,12 @@ def main():
             if hasattr(publisher, 'join'):
                 publisher.join(timeout=12)
 
+        try:
+            observer.flush(outbox, force=True)
+            observer.stopped(exit_reason)
+        except Exception as exc_health:
+            log.warning('Falha ao persistir saúde: %s', type(exc_health).__name__)
+
         total_duration = time.monotonic() - started_mono
         effective_fps = round(frame_number / total_duration, 2) if total_duration > 0 else None
         avg_frame_time = (total_proc_time / frame_number) if frame_number > 0 else None
@@ -520,21 +529,21 @@ def main():
             'detalhe_encerramento': exit_detail,
             'log_mode': c.log_mode,
             'source_mode': c.source_mode,
-            'source': redact_url(c.source),
+            'source': '[redacted]',
             'configuracao_efetiva': {
                 'camera_id': c.camera_id,
                 'codigo_integracao': c.codigo_integracao,
                 'source_mode': c.source_mode,
                 'model_version': c.model_version,
                 'device': c.device,
-                'conf': c.conf,
+                'conf': c.inference_conf,
+                'politica_motor': c.engine_policy(),
                 'iou': c.iou,
                 'imgsz': c.imgsz,
-                'frames_para_alerta': c.frames,
+                'frames_para_alerta': None,
                 'frames_normais_encerrar': c.normal_frames,
                 'cooldown_s': c.cooldown,
                 'max_intervalo_s': c.max_gap,
-                'lost_reset_s': c.lost_reset,
                 'test_mode': c.test,
                 'allow_test_publish': c.allow_test_publish,
                 'publish_rabbit': c.publish,
@@ -546,7 +555,7 @@ def main():
                 'sha256': sha,
                 'classes': names,
             },
-            'revisao_codigo': get_git_revision(),
+            'revisao_codigo': __import__('os').getenv('BUILD_REVISION') or get_git_revision(),
             'video': {
                 'fps': video_fps,
                 'duracao_nominal_s': video_duration,
@@ -565,7 +574,9 @@ def main():
             'eventos': {
                 'confirmados_por_severidade': eventos_por_severidade,
                 'suprimidos_por_severidade': supressoes_por_severidade,
-                'lista_eventos': local_events_summary,
+                'lista_eventos': list(local_events_summary),
+                'lista_eventos_limite': 1000,
+                'arquivo_eventos_completos': 'eventos.jsonl',
             },
             'outbox': {
                 'pendencias_finais': outbox.count(),
@@ -586,6 +597,9 @@ def main():
 
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO)
+    for handler in logging.getLogger().handlers:
+        handler.setFormatter(JsonFormatter())
     try:
         main()
     except ModelCompatibilityError as exc:

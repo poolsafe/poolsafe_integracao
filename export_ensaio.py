@@ -91,6 +91,11 @@ def generate_markdown(data: Dict[str, Any]) -> str:
     eventos = data.get('eventos', {})
     outbox = data.get('outbox', {})
 
+    policy = cfg.get('politica_motor', {})
+    is_v4 = policy.get('engine_version') == 'v4'
+    temporal_description = (f"V4: {policy.get('frames_desequilibrio')} desequilíbrios consecutivos; {policy.get('evidencias_queda')} evidências de queda em até {policy.get('evidencias_queda', 0) + policy.get('tolerancia_queda_frames', 0)} frames" if is_v4 else f"{cfg.get('frames_para_alerta', 8)} frames consecutivos")
+    cooldown_description = 'por câmera, com reavaliação das aberturas pendentes e elevação livre' if is_v4 else 'por severidade'
+
     lines = [
         f"# Relatório de Ensaio — PoolSafe Worker",
         f"",
@@ -118,9 +123,9 @@ def generate_markdown(data: Dict[str, Any]) -> str:
         f"- **Classes Mapeadas no Modelo:** `{classes_modelo}`",
         f"- **Dispositivo de Inferência (Device):** `{cfg.get('device', 'cpu')}`",
         f"- **Resolução (IMGSZ):** `{cfg.get('imgsz', 640)}px` | **Confiança Mínima (CONF):** `{cfg.get('conf', 0.25)}` | **IoU NMS:** `{cfg.get('iou', 0.70)}`",
-        f"- **Frames para Alerta:** `{cfg.get('frames_para_alerta', 8)}` frames consecutivos",
+        f"- **Critério Temporal:** {temporal_description}",
         f"- **Frames Normais para Rearme:** `{cfg.get('frames_normais_encerrar', 15)}` frames",
-        f"- **Cooldown por Severidade:** `{cfg.get('cooldown_s', 3.0)}s`",
+        f"- **Cooldown:** `{cfg.get('cooldown_s', 3.0)}s`, {cooldown_description}",
         f"",
         f"---",
         f"",
@@ -166,7 +171,7 @@ def generate_markdown(data: Dict[str, Any]) -> str:
         f"",
         f"### Contagem por Severidade",
         f"",
-        f"| Severidade | Confirmados | Suprimidos por Cooldown |",
+        f"| Severidade | Confirmados | Candidatos suprimidos por cooldown |",
         f"|---|---|---|",
         f"| `ATENCAO` | `{eventos.get('confirmados_por_severidade', {}).get('ATENCAO', 0)}` | `{eventos.get('suprimidos_por_severidade', {}).get('ATENCAO', 0)}` |",
         f"| `CRITICA` | `{eventos.get('confirmados_por_severidade', {}).get('CRITICA', 0)}` | `{eventos.get('suprimidos_por_severidade', {}).get('CRITICA', 0)}` |",
@@ -208,7 +213,7 @@ def generate_markdown(data: Dict[str, Any]) -> str:
         f"> [!IMPORTANT]",
         f"> 1. **Confiança não é Acurácia:** O score de confiança emitido pelo modelo YOLO indica a convicção estatística da caixa delimitadora, não a exatidão diagnóstica do evento.",
         f"> 2. **Ausência de Métricas Derivadas sem Ground Truth:** Precisão, revocação (recall) e taxa de falsos positivos (FPR) exigem anotação temporal independente (ground truth) e não são estimadas neste resumo para preservar o rigor científico.",
-        f"> 3. **Deduplicação e Cooldown por Câmera:** O cooldown de 3 segundos por severidade opera no escopo global da câmera. Se um segundo indivíduo entrar em risco no mesmo intervalo, seu evento poderá ser suprimido.",
+        f"> 3. **Deduplicação e Cooldown por Câmera:** O cooldown segue a política registrada na configuração efetiva da execução.",
         f"> 4. **Integração Móvel:** Eventos com severidade `ATENCAO` foram classificados e persistidos no worker; a apresentação sem alarme/sirene no aplicativo e nós n8n permanece como pendência das camadas superiores.",
         f""
     ])
