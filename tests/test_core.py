@@ -9,7 +9,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from regras import Motor, validate_model_classes, ModelCompatibilityError, resolve_observation, Decisao
+sys.path.insert(0, str(Path(__file__).resolve().parent / 'fixtures'))
+from legacy_regras import Motor, validate_model_classes, ModelCompatibilityError, resolve_observation, Decisao
 from transporte import Outbox, Publisher
 import export_ensaio
 
