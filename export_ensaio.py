@@ -71,6 +71,14 @@ def find_summary_file(path_arg: Optional[str], run_id: Optional[str], data_dir: 
     raise ValueError("Especifique um caminho, --run-id, ou utilize a flag --latest.")
 
 
+def event_reference(event):
+    if event.get('event_ref'):
+        return f"hash event_ref: {event['event_ref']}"
+    if event.get('eventKey'):
+        return f"eventKey original: {event['eventKey']}"
+    return 'N/D'
+
+
 def generate_markdown(data: Dict[str, Any]) -> str:
     """Gera relatório estruturado em formato Markdown a partir do dicionário de resumo."""
     run_id = data.get('run_id', 'desconhecido')
@@ -185,7 +193,7 @@ def generate_markdown(data: Dict[str, Any]) -> str:
         lines.append("_Nenhum evento de risco confirmado nesta execução._\n")
     else:
         lines.extend([
-            f"| # | Severidade | Classe | Track | Frame | Tempo Vídeo | Confiança | Detected At | Event Key |",
+            f"| # | Severidade | Classe | Track | Frame | Tempo Vídeo | Confiança | Detected At | Referência do evento |",
             f"|---|---|---|---|---|---|---|---|---|",
         ])
         for idx, ev in enumerate(lista_eventos, start=1):
@@ -193,7 +201,7 @@ def generate_markdown(data: Dict[str, Any]) -> str:
             conf = f"{ev.get('confidence'):.4f}" if ev.get('confidence') is not None else "N/D"
             lines.append(
                 f"| {idx} | `{ev.get('severity')}` | `{ev.get('classe')}` | `{ev.get('track_id')}` | "
-                f"`{ev.get('frame_processado')}` | `{vt}` | `{conf}` | `{ev.get('detectedAt')}` | `{ev.get('eventKey')}` |"
+                f"`{ev.get('frame_processado')}` | `{vt}` | `{conf}` | `{ev.get('detectedAt')}` | `{event_reference(ev)}` |"
             )
         lines.append("")
 

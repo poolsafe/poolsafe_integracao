@@ -66,13 +66,18 @@ class BoundaryTest(unittest.TestCase):
         with self.assertRaises(V4InputError):
             detections_from_result(SimpleNamespace(boxes=Boxes()), {0: 'pessoa_queda'})
 
-    def test_reference_classes_are_unchanged(self):
+    def test_reference_except_explicit_cooldown_delta(self):
         root = Path(__file__).resolve().parents[1]
         source = (root/'reference/v4_colab.py.txt').read_text()
         provenance = json.loads((root/'reference/provenance.json').read_text())
         self.assertEqual(hashlib.sha256(source.encode()).hexdigest(), provenance['sha256'])
         original = ast.parse(source)
-        extracted = ast.parse((root/'motor_temporal_v4.py').read_text())
+        production = (root/'motor_temporal_v4.py').read_text()
+        production = production.replace("        self.last_critical = float('-inf')\n", '')
+        production = production.replace("(self.last_critical if cls == 'pessoa_queda' else self.last_event)", 'self.last_event')
+        production = production.replace("                        if cls == 'pessoa_queda':\n                            self.last_critical = video_s\n", '')
+        production = production.replace('    O cooldown é por câmera; atenção não bloqueia crítica, que consulta\n    somente a última crítica. Se bloquear, tenta emitir nos próximos frames', '    O cooldown é por câmera. Se bloquear, tenta emitir nos próximos frames')
+        extracted = ast.parse(production)
         for name in ('MotorTemporal', 'MotorTemporalContinuo'):
             a = next(n for n in original.body if isinstance(n, ast.ClassDef) and n.name == name)
             b = next(n for n in extracted.body if isinstance(n, ast.ClassDef) and n.name == name)

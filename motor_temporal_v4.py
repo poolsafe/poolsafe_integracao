@@ -13,7 +13,8 @@ class MotorTemporal:
         Um episódio emite abertura e, opcionalmente, uma elevação para queda.
         permitir_escalada=False reproduz a política anterior.
         A elevação confirmada ignora o cooldown, mas não repete a mesma gravidade.
-    O cooldown é por câmera. Se bloquear, tenta emitir nos próximos frames
+    O cooldown é por câmera; atenção não bloqueia crítica, que consulta
+    somente a última crítica. Se bloquear, tenta emitir nos próximos frames
     somente enquanto a mesma condição continua confirmada.
     """
 
@@ -41,6 +42,7 @@ class MotorTemporal:
         self.states, self.events = {}, []
         self.transitions = []
         self.last_event = float('-inf')
+        self.last_critical = float('-inf')
 
     @staticmethod
     def new_state():
@@ -230,7 +232,7 @@ class MotorTemporal:
                             evento_referencia=st['event_ref'],
                             id_referencia=duplicate['track_id'],
                             iou=duplicate['iou'], intervalo_s=duplicate['intervalo_s']))
-                    elif not escalada and video_s - self.last_event < self.cooldown:
+                    elif not escalada and video_s - (self.last_critical if cls == 'pessoa_queda' else self.last_event) < self.cooldown:
                         r['suprimido_cooldown'] = True
                         r['motivo'] = 'cooldown_aguardar_persistencia'
                         # Não marca ativo: evita perder definitivamente um evento
@@ -250,6 +252,8 @@ class MotorTemporal:
                             track_id=tid, episodio=st['episode'], transicao=tipo,
                             gravidade_anterior=anterior, gravidade_nova=cls))
                         self.last_event = video_s
+                        if cls == 'pessoa_queda':
+                            self.last_critical = video_s
                         r['evento_emitido'] = True
                         r['motivo'] = 'evento_local_emitido'
                         self.events.append(dict(camera_id=self.camera_id, track_id=tid,

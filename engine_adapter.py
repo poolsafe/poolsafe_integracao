@@ -96,6 +96,10 @@ class MotorV4:
                 handoff_iou=cfg.handoff_iou, handoff_intervalo_s=cfg.handoff_interval)
         except (AssertionError, ValueError, TypeError) as exc:
             raise V4InputError('Política V4 inválida') from exc
+        self.stream_mode = cfg.source_mode == 'stream'
+        self.continuity_gap = cfg.continuity_gap
+        if not math.isfinite(self.continuity_gap) or self.continuity_gap <= 0:
+            raise V4InputError('Limite de continuidade inválido')
         self.last_index = 0
         self.last_time = None
         self.rows, self.transitions, self.continuity = [], [], []
@@ -174,6 +178,20 @@ class MotorV4:
         raw = self.format_input(detections)
         started = time.perf_counter()
         try:
+            # now é monotônico em stream; vídeo mantém seu tempo nominal.
+            if self.stream_mode and self.last_time is not None and now-self.last_time > self.continuity_gap:
+                for st in self.engine.states.values():
+                    self.engine.clear_risk(st)
+                    st['normal'] = 0
+                self.engine.evidencias_queda.clear()
+                self.engine.ultima_caixa.clear()
+                self.engine.ultima_presenca.clear()
+                self.engine.ultima_classe_aceita.clear()
+                self.pending_cooldown.clear()
+                self.engine.auditoria_continuidade.append(dict(
+                    frame=frame_number, tempo_video_s=now,
+                    transicao='interrupcao_lacuna_stream', intervalo_s=now-self.last_time,
+                    limite_s=self.continuity_gap))
             rows = self.engine.step(frame_number, now, raw)
             events = list(self.engine.events)
             self._validate_response(rows, events, frame_number, raw)

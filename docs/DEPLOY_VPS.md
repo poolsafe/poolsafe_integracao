@@ -29,7 +29,7 @@ O Dockerfile instala por padrão wheels CPU de torch/torchvision no índice ofic
 Build local no diretório do pacote:
 
 ```bash
-docker build --build-arg BUILD_REVISION=release-v4-20261027 -t poolsafe-worker:v4-cpu .
+docker build --build-arg BUILD_REVISION="$(git rev-parse HEAD)" -t poolsafe-worker:v4-cpu .
 docker run --rm --network none poolsafe-worker:v4-cpu python -c "import torch, torchvision, cv2, pika, ultralytics, engine_adapter; print('imports-ok')"
 docker run --rm --network none poolsafe-worker:v4-cpu python -m pip freeze
 ```
@@ -41,7 +41,7 @@ Os comandos são instruções, não resultados desta entrega. CI mantém a publi
 Criar diretórios somente para a câmera escolhida, preservando dados existentes:
 
 ```bash
-sudo install -d -m 0755 /opt/poolsafe/modelos/releases/modelo-v4
+sudo install -d -m 0755 /opt/poolsafe/modelos/releases/modelo-002
 sudo install -d -m 0755 /opt/poolsafe/entrada
 sudo install -d -m 0750 -o 10001 -g 10001 /opt/poolsafe/dados/camera_teste_01
 cp .env.example stack.env
@@ -87,7 +87,7 @@ Usar somente se há GPU NVIDIA real, driver e NVIDIA Container Toolkit validados
 Exemplo de build CUDA da família compatível com torch 2.6, a homologar no driver real:
 
 ```bash
-docker build --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124 --build-arg BUILD_REVISION=release-v4-20261027 -t poolsafe-worker:v4-cu124 .
+docker build --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124 --build-arg BUILD_REVISION="$(git rev-parse HEAD)" -t poolsafe-worker:v4-cu124 .
 docker run --rm --gpus all --network none poolsafe-worker:v4-cu124 python -c "import torch; print(torch.cuda.is_available()); print(torch.version.cuda)"
 docker compose --env-file stack.env -f compose.yaml -f compose.gpu.yaml config --quiet
 docker compose --env-file stack.env -f compose.yaml -f compose.gpu.yaml up -d

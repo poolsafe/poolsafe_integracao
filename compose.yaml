@@ -72,6 +72,7 @@ services:
       IMGSZ: ${IMGSZ:-640}
       FRAMES_NORMAIS_ENCERRAR: ${FRAMES_NORMAIS_ENCERRAR:-15}
       COOLDOWN_S: ${COOLDOWN_S:-3}
+      CONTINUIDADE_MAX_INTERVALO_S: ${CONTINUIDADE_MAX_INTERVALO_S:-2.0}
       MAX_INTERVALO_S: ${MAX_INTERVALO_S:-0.5}
       HEARTBEAT_INTERVAL_S: ${HEARTBEAT_INTERVAL_S:-30}
       HEARTBEAT_TTL_S: ${HEARTBEAT_TTL_S:-60}
@@ -89,9 +90,9 @@ services:
       RABBIT_ALERT_KEY: ${RABBIT_ALERT_KEY:-risk.detected}
       RABBIT_HEARTBEAT_KEY: ${RABBIT_HEARTBEAT_KEY:-camera.heartbeat}
     volumes:
-      - ${HOST_MODEL_DIR:-/opt/poolsafe/modelos/releases/modelo-001}:/modelos:ro
+      - ${HOST_MODEL_DIR:-/opt/poolsafe/modelos/releases/modelo-002}:/modelos:ro
       - ${HOST_VIDEO_DIR:-/opt/poolsafe/entrada}:/entrada:ro
-      - ${HOST_DATA_DIR:-/opt/poolsafe/dados/ensaio-modelo-001}:/dados
+      - ${HOST_DATA_DIR:-/opt/poolsafe/dados/ensaio-modelo-002}:/dados
     networks:
       - poolsafe-network
     # GPU NVIDIA: descomentar após instalar NVIDIA Container Toolkit no host.

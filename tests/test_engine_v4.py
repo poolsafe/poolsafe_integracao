@@ -1,3 +1,6 @@
+import ast
+import math
+from collections import Counter, deque
 import json
 import random
 from pathlib import Path
@@ -111,7 +114,11 @@ class EngineV4Test(unittest.TestCase):
             rng = random.Random(seed)
             cfg = self.cfg(cooldown=0)
             m = MotorV4(cfg)
-            reference = MotorTemporalContinuo({'pessoa_normal': 0.3, 'pessoa_desequilibrio': 0.65, 'pessoa_queda': 0.5}, {'pessoa_desequilibrio': 15, 'pessoa_queda': 10}, {'pessoa_desequilibrio', 'pessoa_queda'}, cooldown=0, camera_id=cfg.camera_id, deduplicar_quedas=True)
+            source = ast.parse((Path(__file__).resolve().parents[1]/'reference/v4_colab.py.txt').read_text())
+            classes = [n for n in source.body if isinstance(n, ast.ClassDef) and n.name in ('MotorTemporal', 'MotorTemporalContinuo')]
+            ns = dict(math=math, Counter=Counter, deque=deque, CLASSES={'pessoa_normal','pessoa_desequilibrio','pessoa_queda'}, CLASSES_RISCO=('pessoa_desequilibrio','pessoa_queda'))
+            exec(compile(ast.Module(body=classes,type_ignores=[]), '<original>', 'exec'),ns)
+            reference = ns['MotorTemporalContinuo']({'pessoa_normal': 0.3, 'pessoa_desequilibrio': 0.65, 'pessoa_queda': 0.5}, {'pessoa_desequilibrio': 15, 'pessoa_queda': 10}, {'pessoa_desequilibrio', 'pessoa_queda'}, cooldown=0, camera_id=cfg.camera_id, deduplicar_quedas=True)
             expected, actual = ([], [])
             label = 'pessoa_queda'
             for index in range(1, 501):
@@ -157,3 +164,37 @@ class EngineV4Test(unittest.TestCase):
             self.assertEqual(second['severity'], 'CRITICA')
             self.assertEqual(first['severity'], 'ATENCAO')
             self.assertNotEqual(second['eventKey'], first_key)
+            from export_ensaio import generate_markdown, event_reference
+            report = generate_markdown(summary)
+            for event in summary['eventos']['lista_eventos']:
+                self.assertIn('hash event_ref: ' + event['event_ref'], report)
+            self.assertEqual(event_reference({'eventKey':'old'}),'eventKey original: old')
+
+class RegressionTest(unittest.TestCase):
+    cfg = EngineV4Test.cfg
+    feed = EngineV4Test.feed
+    def test_temporal_gap(self):
+        for mode, n in [('stream',0),('video',1)]:
+            m=MotorV4(self.cfg(source_mode=mode))
+            self.feed(m,[(9,[detection()])])
+            self.assertEqual(sum(e.status=='confirmado' for e in m.update_detections([detection()],10,120.)),n)
+        m=MotorV4(self.cfg(source_mode='stream'))
+        self.assertEqual(len(self.feed(m,[(10,[detection()])])),1)
+
+    def test_partial_counts_and_active_episode(self):
+        for label, count in [('pessoa_desequilibrio',14),('pessoa_normal',14)]:
+            m=MotorV4(self.cfg(source_mode='stream'))
+            self.feed(m,[(10,[detection()]),(count,[detection(label=label)])])
+            m.update_detections([detection(label=label)],25,120.)
+            self.assertTrue(m.get_track_state(1)['active_critica'])
+            self.assertEqual(m.get_track_state(1)['normal' if label=='pessoa_normal' else 'streak_atencao'],1)
+            self.assertFalse([e for e in m.update_detections([detection()],26,120.1) if e.status=='confirmado'])
+
+    def test_attention_does_not_block_other_id_or_person(self):
+        for tid, bounds in [(1,(0,0,100,100)),(2,(0,0,100,100)),(2,(300,0,400,100))]:
+            m=MotorV4(self.cfg())
+            events=self.feed(m,[(15,[detection(label='pessoa_desequilibrio')]),(40,[detection(tid,bounds=bounds)])])
+            self.assertEqual([e.severity for e in events],['ATENCAO','CRITICA'])
+            self.assertEqual(events[1].event['frame'],25)
+            if tid==2:
+                self.assertNotEqual(events[0].event['evento_referencia'],events[1].event['evento_referencia'])

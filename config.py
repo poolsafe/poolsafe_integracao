@@ -52,6 +52,7 @@ class Config:
     log_mode: str = os.getenv('LOG_MODE', 'production').lower()
     normal_frames: int = int(os.getenv('FRAMES_NORMAIS_ENCERRAR', '15'))
     cooldown: float = float(os.getenv('COOLDOWN_S', '3'))
+    continuity_gap: float = float(os.getenv('CONTINUIDADE_MAX_INTERVALO_S', '2.0'))
     max_gap: float = float(os.getenv('MAX_INTERVALO_S', '0.5'))
     heartbeat_interval: float = float(os.getenv('HEARTBEAT_INTERVAL_S', '30'))
     heartbeat_ttl: float = float(os.getenv('HEARTBEAT_TTL_S', '60'))
@@ -85,10 +86,12 @@ class Config:
             'frames_desequilibrio': self.frames_desequilibrio,
             'evidencias_queda': self.frames_queda, 'tolerancia_queda_frames': self.fall_tolerance,
             'normal_frames': self.normal_frames, 'cooldown_s': self.cooldown,
-            'cooldown_policy': 'camera_aberturas_reavaliadas_elevacao_livre',
+            'cooldown_policy': 'camera_critica_independente_de_atencao_elevacao_livre',
             'dedup_iou': self.dedup_iou, 'dedup_intervalo_s': self.dedup_interval,
             'handoff': self.handoff, 'handoff_iou': self.handoff_iou,
             'handoff_intervalo_s': self.handoff_interval, 'engine_fps': self.engine_fps,
+            'continuidade_max_intervalo_s': self.continuity_gap,
+            'continuidade_policy': 'stream_monotonico_limpa_pendencias_preserva_episodios',
             'stream_sampling': 'latest_decoded_frame',
             'emit_attention': self.emit_attention,
         }
@@ -98,7 +101,7 @@ class Config:
             raise ValueError('Somente ENGINE_VERSION=v4 é suportado')
         if min(self.torch_threads, self.torch_interop_threads, self.metrics_window, self.v4_log_every) < 1 or self.opencv_threads < 0:
             raise ValueError('Parâmetros de recursos inválidos')
-        for value in (self.engine_fps, self.metrics_interval, self.health_stale, self.max_gap):
+        for value in (self.engine_fps, self.metrics_interval, self.health_stale, self.max_gap, self.continuity_gap):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError('Intervalos de execução inválidos')
         if self.log_mode not in {'development', 'production'}:
