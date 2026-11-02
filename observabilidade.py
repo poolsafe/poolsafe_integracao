@@ -56,8 +56,18 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(output, ensure_ascii=False, allow_nan=False)
 
 
-def log_event(logger, event, level=logging.INFO, **fields):
-    logger.log(level, event, extra={'event_name': event, 'fields': fields})
+def log_event(logger, event, level=logging.INFO, message=None, **fields):
+    logger.log(level, message or event, extra={'event_name': event, 'fields': fields})
+
+
+def log_risk_event(logger, mode, *, classe, track_id, observed_at, **fields):
+    message = None
+    if mode == 'homologation':
+        badge = '🔴 CRITICA' if fields['severity'] == 'CRITICA' else '🟡 ATENCAO'
+        message = (f"{badge} evento={fields['event_ref']} classe={classe} "
+                   f"track={track_id} frame={fields['frame']} observado_em={observed_at}")
+    log_event(logger, 'risk.event', message=message, classe=classe, track_id=track_id,
+              observed_at=observed_at, **fields)
 
 
 def percentile(values, p):
@@ -78,13 +88,16 @@ class Observer:
         self.previous_sequence = None
         self.skipped = 0
         self.lock = threading.Lock()
+        self.period_classes = {}
+        self.operational = {}
         self.samples = {key: deque(maxlen=cfg.metrics_window) for key in ('inference_ms', 'v4_ms', 'pipeline_ms', 'frame_age_ms')}
 
     def captured(self):
         with self.lock:
             self.last_capture = time.monotonic()
 
-    def completed(self, sequence, inference_s, v4_s, pipeline_s, frame_age_s):
+    def completed(self, sequence, inference_s, v4_s, pipeline_s, frame_age_s,
+                  detections=(), frame=None, segment=None):
         now = time.monotonic()
         with self.lock:
             if self.previous_sequence is not None:
@@ -94,6 +107,25 @@ class Observer:
             self.last_inference = now
             for key, value in zip(self.samples, (inference_s, v4_s, pipeline_s, frame_age_s)):
                 self.samples[key].append(max(0, value)*1000)
+            if self.cfg.log_mode == 'homologation':
+                current = {}
+                for d in detections:
+                    label = d['classe']
+                    current[label] = current.get(label, 0) + 1
+                    self.period_classes[label] = self.period_classes.get(label, 0) + 1
+                if self.frames % self.cfg.homologation_log_every == 0:
+                    payload = dict(self.operational, run_ref=reference(self.run_id), frame=frame or self.frames,
+                                   segment=segment, frames=self.frames, capture_skipped=self.skipped,
+                                   detections_by_class=current, interval_detections_by_class=self.period_classes,
+                                   track_ids=sorted({d['track_id'] for d in detections if d['track_id'] is not None}),
+                                   capture_age_s=None if self.last_capture is None else max(0, now-self.last_capture),
+                                   inference_age_s=0.0, reference_fps=self.cfg.engine_fps,
+                                   fps_effective=round(self.frames/max(.001, now-self.started), 3))
+                    for key, values in self.samples.items():
+                        payload[key] = dict(p50=percentile(values, .5), p95=percentile(values, .95),
+                                            max=round(max(values), 3) if values else None)
+                    log_event(self.log, 'worker.homologation_summary', **payload)
+                    self.period_classes = {}
 
     def flush(self, outbox, force=False):
         now = time.monotonic()
@@ -119,7 +151,10 @@ class Observer:
                 payload['outbox_oldest_age_s'] = round(max(0, time.time()-detected), 3)
             except (ValueError, TypeError, KeyError):
                 payload['outbox_oldest_age_s'] = None
-        log_event(self.log, 'worker.metrics', **payload)
+        homologation = self.cfg.log_mode == 'homologation'
+        self.operational = {key: payload[key] for key in ('outbox_pending', 'outbox_oldest_age_s') if key in payload}
+        if not homologation:
+            log_event(self.log, 'worker.metrics', **payload)
         stale = inference_age is None or inference_age > self.cfg.health_stale
         if self.cfg.source_mode == 'stream':
             stale = stale or capture_age is None or capture_age > self.cfg.health_stale
@@ -129,12 +164,13 @@ class Observer:
         temporary = path.with_suffix('.tmp')
         temporary.write_text(json.dumps(health, ensure_ascii=False, allow_nan=False), encoding='utf-8')
         os.replace(temporary, path)
-        if payload['frames'] and payload['fps_effective'] < self.cfg.engine_fps:
+        if not homologation and payload['frames'] and payload['fps_effective'] < self.cfg.engine_fps:
             log_event(self.log, 'worker.sampling_below_reference', level=logging.WARNING,
                       fps_effective=payload['fps_effective'], reference_fps=self.cfg.engine_fps)
-        if stale:
+        if stale and (not homologation or getattr(self, '_was_stale', None) != stale):
             log_event(self.log, 'worker.degraded', level=logging.WARNING,
                       capture_age_s=capture_age, inference_age_s=inference_age)
+        self._was_stale = stale
 
     def stopped(self, reason):
         path = Path(self.cfg.data_dir) / 'health.json'

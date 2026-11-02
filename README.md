@@ -5,6 +5,7 @@ O worker usa exclusivamente o núcleo temporal V4 extraído do script fornecido.
 - [Refatoração, estrutura e contratos](docs/REFATORACAO_V4.md)
 - [Implantação na VPS, CPU/GPU e escala](docs/DEPLOY_VPS.md)
 - [Logs JSON e monitoramento](docs/LOGS_MONITORAMENTO.md)
+- [Homologação do stream e capturas anotadas](docs/HOMOLOGACAO_STREAM.md)
 - [Contrato de transporte existente](CONTRATO_N8N.md)
 
 ## Início

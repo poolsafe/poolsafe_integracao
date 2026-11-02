@@ -22,7 +22,8 @@ from captura import StreamReader, utc_now
 from config import Config
 from engine_adapter import MotorV4, validate_model_classes, ModelCompatibilityError, V4Error, detections_from_result
 from transporte import Outbox, Publisher
-from observabilidade import JsonFormatter, Observer, log_event, reference
+from observabilidade import JsonFormatter, Observer, log_event, log_risk_event, reference
+from capturas_inspecao import CaptureWriter
 from runtime_support import configure_runtime, synchronize_device
 
 log = logging.getLogger('poolsafe')
@@ -171,6 +172,7 @@ def main():
     from collections import deque
     local_events_summary = deque(maxlen=1000)
     observer = Observer(c, run_id)
+    captures = CaptureWriter(c, run_dir, run_id)
 
     total_proc_time = 0.0
     min_frame_proc_time = None
@@ -339,8 +341,8 @@ def main():
                 raise
             observations = {d['track_id']: d['classe'] for d in detections if d['track_id'] is not None}
 
-            trace_validation = c.log_mode == 'development' or frame_number % c.v4_log_every == 0
-            if trace_validation and c.source_mode == 'stream' and motor.last_time is not None and logical_time-motor.last_time > c.max_gap:
+            trace_validation = c.log_mode != 'homologation' and (c.log_mode == 'development' or frame_number % c.v4_log_every == 0)
+            if (trace_validation or c.log_mode == 'homologation') and c.source_mode == 'stream' and motor.last_time is not None and logical_time-motor.last_time > c.max_gap:
                 log_event(log, 'v4.sampling_gap', level=logging.WARNING,
                           gap_s=round(logical_time-motor.last_time, 3), frame=frame_number)
             if trace_validation:
@@ -353,13 +355,18 @@ def main():
                           frame=frame_number, segment=generation, error_code=exc.code,
                           error_type=type(exc).__name__, engine_ms=round(motor.duration_s*1000, 3))
                 raise
-            if trace_validation or decisions:
+            if trace_validation or (decisions and c.log_mode != 'homologation'):
                 log_event(log, 'v4.response', run_ref=reference(run_id), frame=frame_number,
                           engine_ms=round(motor.duration_s*1000, 3), rows=len(motor.rows),
                           emitted=sum(d.status == 'confirmado' for d in decisions),
                           transitions=len(motor.transitions), handoffs=len(motor.continuity))
             if motor.continuity:
                 log_event(log, 'v4.handoff', frame=frame_number, transfers=len(motor.continuity))
+                for transition in motor.continuity:
+                    if transition.get('transicao') == 'interrupcao_lacuna_stream':
+                        log_event(log, 'v4.continuity_interrupted', level=logging.WARNING,
+                                  frame=frame_number, segment=generation,
+                                  gap_s=transition['intervalo_s'], limit_s=transition['limite_s'])
             frame_proc_time = time.monotonic() - process_start
 
             # Agregação de latências sem manter medições infinitas em memória
@@ -401,6 +408,7 @@ def main():
                 audit.info('v4.frame', extra={'event_name': 'v4.frame', 'fields': audit_record})
 
             # Processamento de decisões de risco
+            capture_events = []
             for d in decisions:
                 tid, decision_status, severity = d.track_id, d.status, d.severity
                 if decision_status != 'confirmado':
@@ -453,10 +461,12 @@ def main():
                 if publisher:
                     outbox.put(event, expires)
 
-                log.info('Evento local=%s severity=%s classe=%s cameraCode=%s track=%s video_time=%s publicação=%s',
-                         event_key, severity, confirmed_class, camera_code, tid, video_time, c.publish)
+                if c.log_mode != 'homologation':
+                    log.info('Evento local=%s severity=%s classe=%s cameraCode=%s track=%s video_time=%s publicação=%s',
+                             event_key, severity, confirmed_class, camera_code, tid, video_time, c.publish)
 
-                log_event(log, 'risk.event', event_ref=reference(event_key), run_ref=reference(run_id),
+                log_risk_event(log, c.log_mode, classe=confirmed_class, track_id=tid, observed_at=observed,
+                          event_ref=reference(event_key), run_ref=reference(run_id),
                           frame=frame_number, severity=severity, engine='v4',
                           event_kind=engine_event['tipo_evento'],
                           evidence_count=len(engine_event.get('frames_evidencias', [])))
@@ -473,10 +483,15 @@ def main():
                 with (run_dir / 'eventos.jsonl').open('a', encoding='utf-8') as event_log:
                     event_log.write(json.dumps(summary_event, ensure_ascii=False) + '\n')
                 local_events_summary.append(summary_event)
+                capture_events.append(summary_event)
 
-
+            captures.submit(frame, detections, motor.rows, events=capture_events,
+                            segment=generation, processed_frame=frame_number,
+                            captured_frame=capture_sequence, observed_at=observed,
+                            video_time_s=video_time, sample_time=logical_time)
             observer.completed(capture_sequence, inference_s, motor.duration_s,
-                               time.monotonic()-process_start, frame_age_s)
+                               time.monotonic()-process_start, frame_age_s,
+                               detections=detections, frame=frame_number, segment=generation)
 
     except ModelCompatibilityError as exc:
         exit_reason = f'erro_compatibilidade_modelo_{exc.code}'
@@ -490,6 +505,7 @@ def main():
         raise
     finally:
         stopping.set()
+        captures.close()
         if cap:
             cap.release()
         if reader:
@@ -549,7 +565,15 @@ def main():
                 'publish_rabbit': c.publish,
                 'include_evidence': c.evidence,
                 'max_pending_events': c.max_pending,
+                'homologation_log_every_n_frames': c.homologation_log_every,
+                'captures_enabled': c.captures_enabled,
+                'captures_interval_s': c.captures_interval,
+                'captures_max_count': c.captures_max_count,
+                'captures_max_bytes': c.captures_max_bytes,
             },
+            'capturas': {'quantidade': captures.count, 'bytes': captures.bytes,
+                         'suspensas_por_limite': captures.suspended,
+                         'avisos': sorted(captures.warned), 'indice': 'capturas/indice.jsonl'},
             'modelo': {
                 'versao': c.model_version,
                 'sha256': sha,

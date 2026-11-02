@@ -50,6 +50,11 @@ class Config:
     normal_class: str = os.getenv('NORMAL_CLASS', 'pessoa_normal')
     desequilibrio_class: str = os.getenv('DESEQUILIBRIO_CLASS', 'pessoa_desequilibrio')
     log_mode: str = os.getenv('LOG_MODE', 'production').lower()
+    homologation_log_every: int = int(os.getenv('HOMOLOGATION_LOG_EVERY_N_FRAMES', '100'))
+    captures_enabled: bool = flag('CAPTURES_ENABLED') if os.getenv('CAPTURES_ENABLED', '') else None
+    captures_interval: float = float(os.getenv('CAPTURES_INTERVAL_S', '1'))
+    captures_max_count: int = int(os.getenv('CAPTURES_MAX_COUNT', '1000'))
+    captures_max_bytes: int = int(os.getenv('CAPTURES_MAX_BYTES', '524288000'))
     normal_frames: int = int(os.getenv('FRAMES_NORMAIS_ENCERRAR', '15'))
     cooldown: float = float(os.getenv('COOLDOWN_S', '3'))
     continuity_gap: float = float(os.getenv('CONTINUIDADE_MAX_INTERVALO_S', '2.0'))
@@ -74,6 +79,10 @@ class Config:
     exchange: str = os.getenv('RABBIT_EXCHANGE', 'poolsafe.events')
     alert_key: str = os.getenv('RABBIT_ALERT_KEY', 'risk.detected')
     heartbeat_key: str = os.getenv('RABBIT_HEARTBEAT_KEY', 'camera.heartbeat')
+
+    def __post_init__(self):
+        if self.captures_enabled is None:
+            self.captures_enabled = self.log_mode == 'homologation'
 
     @property
     def inference_conf(self):
@@ -104,8 +113,12 @@ class Config:
         for value in (self.engine_fps, self.metrics_interval, self.health_stale, self.max_gap, self.continuity_gap):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError('Intervalos de execução inválidos')
-        if self.log_mode not in {'development', 'production'}:
-            raise ValueError('LOG_MODE deve ser development ou production')
+        if self.log_mode not in {'development', 'production', 'homologation'}:
+            raise ValueError('LOG_MODE deve ser development, production ou homologation')
+        if min(self.homologation_log_every, self.captures_max_count, self.captures_max_bytes) < 1:
+            raise ValueError('Limites de observabilidade devem ser positivos')
+        if not math.isfinite(self.captures_interval) or self.captures_interval <= 0:
+            raise ValueError('CAPTURES_INTERVAL_S deve ser positivo e finito')
         if self.source_mode not in {'video', 'stream'}:
             raise ValueError('SOURCE_MODE deve ser video ou stream')
         if not self.camera_id or not self.source:

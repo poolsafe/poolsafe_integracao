@@ -8,6 +8,12 @@ URLs completas são removidas; chaves sensíveis, base64, evidência e tokens s�
 
 Em produção, logs de sucesso request/response V4 são amostrados por `V4_LOG_EVERY_N_FRAMES=150`, e respostas com decisões são registradas mesmo fora da amostragem. Em desenvolvimento, cada frame possui auditoria com caixas, limiares, transições e handoff. Usar desenvolvimento por períodos curtos, com retenção e acesso restritos.
 
+Em `LOG_MODE=homologation`, um único `worker.homologation_summary` a cada
+`HOMOLOGATION_LOG_EVERY_N_FRAMES=100` substitui os logs periódicos request/response
+e metrics. Eventos confirmados mantêm `risk.event` imediato, com mensagem
+`🔴 CRITICA` ou `🟡 ATENCAO`. Saúde e heartbeat mantêm suas frequências.
+Consulte [variáveis, capturas persistentes e coleta](HOMOLOGACAO_STREAM.md).
+
 ## Catálogo de eventos
 
 | Evento | Campos principais | Interpretação |
