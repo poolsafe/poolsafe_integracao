@@ -12,6 +12,8 @@ Não foi realizado build, push, deploy ou acesso à VPS nesta implementação.
 |---|---|---|
 | `LOG_MODE` | `production` no código/Compose | Aceita também `development` e `homologation`; o exemplo de ambiente mantém `development` |
 | `HOMOLOGATION_LOG_EVERY_N_FRAMES` | `100` | Um resumo a cada N frames **processados**, sem pular chamadas de inferência/motor |
+| `HOMOLOGATION_DIAGNOSTICS_ENABLED` | `false` | Auditoria detalhada somente em arquivo e somente em homologation |
+| `HOMOLOGATION_DIAGNOSTICS_MAX_FRAMES` | `600` | Máximo de frames auditados por run; inteiro positivo |
 | `CAPTURES_ENABLED` | vazio = automático | Ativa em homologation; desativa nos outros modos. `true`/`false` sobrescrevem |
 | `CAPTURES_INTERVAL_S` | `1` | Intervalo mínimo por câmera entre amostras sem evento; eventos ignoram o intervalo |
 | `CAPTURES_MAX_COUNT` | `1000` | Máximo de JPEGs por execução |
@@ -29,8 +31,17 @@ Em homologation, não há `deteccoes.jsonl`, `v4.request` nem `v4.response`.
 continua atualizado por `METRICS_INTERVAL_S`, incluindo backlog, idades e desempenho.
 Mudança para estado degradado gera aviso imediato na próxima verificação de saúde.
 Heartbeat local mantém a frequência original; captura, reconexões, falhas, início,
-fim, lacunas de amostragem, interrupções de continuidade e eventos são independentes
+fim, interrupções efetivas de continuidade e eventos são independentes
 do contador do resumo. Não existe espera ou salto de inferência para produzir logs.
+
+Em homologation, `v4.sampling_gap` não é emitido individualmente. O resumo acumula
+`sampling_gap_count`, `sampling_gap_max_s` (valor sem arredondamento) e
+`continuity_interruptions` desde o último resumo, zerando-os após cada N frames.
+`v4.continuity_interrupted` permanece imediato quando uma lacuna realmente limpa
+contagens de risco/recuperação ou evidências de queda. Lacuna com estado já vazio
+não conta como interrupção efetiva. Episódios ativos continuam preservados.
+O intervalo final incompleto não gera resumo adicional; lacunas constam também da
+auditoria enquanto ela estiver ativa. Os demais modos mantêm o aviso de sampling gap.
 
 O resumo contém contagens de caixas por classe no frame atual e acumuladas desde o
 último resumo, IDs presentes, frame/segmento, FPS desde o início, descartes e
@@ -105,6 +116,111 @@ tar -C /opt/poolsafe/dados/ensaio-modelo-002/runs -czf /destino/ensaio.tar.gz <r
 Imagens contêm pessoas: restringir acesso e aplicar a retenção do ensaio.
 A inspeção é humana; não se calcula precisão/recall automaticamente sem anotações.
 
+## Diagnóstico detalhado opcional
+
+Para o próximo ensaio, definir no ambiente/Compose existente:
+
+```dotenv
+LOG_MODE=homologation
+HOMOLOGATION_DIAGNOSTICS_ENABLED=true
+HOMOLOGATION_DIAGNOSTICS_MAX_FRAMES=600
+```
+
+Preservar fonte, pesos, política e parâmetros de publicação do ensaio. Nenhuma
+dessas variáveis habilita publicação. O override GPU herda as duas variáveis do
+Compose base. Coletar `/dados/runs/<run_id>/diagnostico_frames.jsonl`,
+`resumo.json` e `servico.log` no volume já existente; o comando tar acima inclui
+esses arquivos. Para desabilitar no próximo run, usar `false`.
+
+Cada linha corresponde a um frame **processado**, inclusive sem detecções. Frames
+descartados pelo slot/idade antes da inferência não são auditados. O limite conta
+frames por execução, não por segmento e não por caixa. Ao gravar o último frame,
+`diagnostics.warning` com `code=frame_limit_reached` avisa uma única vez e suspende
+apenas a auditoria. O motor, eventos e capturas continuam. Registros individuais
+não passam pelo logger nem pelo console. Não são produzidas imagens novas por
+esta funcionalidade: o mecanismo de JPEGs mantém seus critérios atuais.
+
+Falha ao criar diretório, serializar, abrir, escrever ou fechar o arquivo suspende
+a auditoria, com aviso único `write_failed` e somente o tipo da exceção. Isso não
+interrompe detecção/publicação. Uma falha de disco pode deixar a última linha
+incompleta; preservar o arquivo original e ignorar essa linha na análise. O bloco
+`diagnostico` de `resumo.json` informa habilitação efetiva, tentativas, linhas
+gravadas, suspensão, avisos, versão e último status da observação pré-tracker.
+
+Campos principais: run/segmento, frames processado e capturado, `observado_em`
+UTC e `referencia_temporal` (monotônico de captura no stream; nominal do vídeo,
+com primeiro frame em 0 s). Esses dois relógios não devem ser subtraídos entre si.
+`observacoes` são as linhas reais do motor, com limiar, aceitação, uso temporal,
+motivo, contagens, evidências na janela, confirmação, recuperação e episódio.
+`estado_antes`/`estado_depois` fotografam os estados e os frames/tempos de evidência
+de queda, incluindo IDs ausentes neste frame. `ids_ausentes` significa ausência
+de ID na entrada do motor, sem atribuir causa a oclusão, detector ou tracker.
+`continuidade` traz handoffs e lacunas, inclusive `limpeza_efetiva` e os IDs com
+evidências limpas; `transicoes` e `decisoes` preservam a resposta do motor.
+Comparar antes/depois permite ver resets por ausência ou rejeição e expiração de
+evidências da janela sem confundi-los com recuperação confirmada. O V4 pode
+reter evidências de queda na janela mesmo quando zera contagens consecutivas.
+
+Exemplos **abreviados e ilustrativos**, não reconstruções do ensaio anterior:
+
+```json
+{"frame_processado":111,"sem_deteccao":true,"observacoes":[],"decisoes":[]}
+{"frame_processado":112,"deteccoes_sem_id":1,"observacoes":[{"track_id":null,"classe":"pessoa_queda","confianca":0.528,"limiar_classe":0.5,"aceita":true,"usada_temporal":false,"confirmacao_temporal":false,"motivo":"sem_id"}],"decisoes":[]}
+{"frame_processado":113,"observacoes":[{"track_id":7,"confianca":0.49,"aceita":false,"motivo":"abaixo_limiar"}]}
+{"frame_processado":114,"observacoes":[{"track_id":7,"aceita":true,"confirmacao_temporal":false,"motivo":"aguardando_persistencia","evidencias_queda_janela":1}]}
+```
+
+Assim, uma queda com 0,528 pode passar pelo limiar 0,50 e continuar sem evento
+por `sem_id`; isso difere de rejeição por confiança e de persistência incompleta.
+O arquivo anterior de capturas é amostrado e não permite recuperar retroativamente
+os passos que não foram registrados.
+
+### Etapas do detector/tracker e limites técnicos
+
+O requirements fixa `ultralytics==8.4.173`. Foram inspecionados os fontes do wheel
+exato obtido do PyPI e os fontes oficiais de
+[tracking](https://github.com/ultralytics/ultralytics/blob/v8.4.173/ultralytics/trackers/track.py),
+[predictor](https://github.com/ultralytics/ultralytics/blob/v8.4.173/ultralytics/engine/predictor.py) e
+[detecção](https://github.com/ultralytics/ultralytics/blob/v8.4.173/ultralytics/models/yolo/detect/predict.py).
+No Python local de validação, Ultralytics não está instalado; não foi realizada
+inferência com pesos/câmera reais. A versão instalada no worker é obtida por
+metadata em runtime e gravada no diagnóstico.
+
+1. `etapas.detector_pos_nms`: cópia das caixas de `predictor.results` no callback
+   observador `on_predict_postprocess_end`, registrado no modelo novo antes da
+   primeira chamada `track`. O pós-processamento já aplicou confiança de
+   inferência (`min(CONF_NORMAL, CONF_DESEQUILIBRIO, CONF_QUEDA)`), NMS/IoU,
+   seleção de classes e `max_det` da biblioteca, com coordenadas escaladas à
+   imagem original. Os parâmetros efetivos disponíveis ficam em
+   `parametros_posprocessamento`; não há acesso às caixas abaixo desse limiar
+   nem às descartadas por NMS. No YOLO11 de detecção, esse ponto é pós-NMS.
+2. `etapas.apos_tracker`: resultado retornado pela mesma chamada `model.track`,
+   com IDs ou `null`, exatamente como recebido pelo motor. Em 8.4.173, se o
+   tracker retorna tracks, a biblioteca seleciona as caixas pelos índices dos
+   tracks e atualiza os resultados; se não retorna tracks, mantém as caixas
+   originais sem ID. Portanto, uma caixa pré-tracker ausente na saída não tem
+   automaticamente um motivo individual de descarte conhecido.
+
+Há uma única chamada `track` por frame. Não há `predict` adicional, alteração de
+ByteTrack ou reutilização de uma segunda inferência. Os dados são convertidos a
+listas e copiados antes da mutação; nenhum tensor/Results é retido ou modificado.
+O observador é acrescentado sem substituir, envolver ou reordenar os callbacks
+de tracking. O registro normal da biblioteca permanece responsável pelo tracker,
+inclusive ao recriar o predictor em reconexões. O hook torna-se inativo ao
+encerrar a coleta.
+
+Em versão diferente de 8.4.173, tracker já registrado antes da instalação, API
+incompatível ou falha do callback, o diagnóstico registra status
+`indisponivel_*` (ou `callback_nao_executado`) e `detector_pos_nms=null`, em vez
+de alegar uma observação pré-tracker. `[]` significa etapa observada sem caixas.
+A saída pós-tracker e o motor continuam auditáveis. O hook atende o contrato
+atual de uma imagem por chamada; batches maiores são marcados indisponíveis.
+Não é possível deduzir por essas etapas o motivo interno de cada associação ou
+rejeição do ByteTrack. O JSONL é síncrono, com abertura/fechamento por frame para
+coleta durante o ensaio; cópias CPU e I/O acrescentam latência e podem afetar a
+amostragem de um stream sob carga. As decisões para a mesma sequência de entradas
+são preservadas; isso não garante a mesma sequência capturada em ensaios distintos.
+
 ## Validação
 
 Local: `PYTHONUTF8=1 python -m unittest discover -s tests -v` (em PowerShell,
@@ -118,13 +234,26 @@ limites e falhas de codificação/permissão. O worker com fixtures é comparado
 os três modos, incluindo falha de gravação: mesmas decisões, 25 inferências para
 25 frames e mesmos envelopes/evidências na outbox.
 
-Resultado local em 02/11/2026: **79 testes passaram, sem skips**, em Python 3.12.14
+Resultado local atualizado em 02/11/2026: **91 testes passaram, sem skips**, em Python 3.12.14
 no Windows, com NumPy 2.1.3 e OpenCV 4.11.0.86 instalados apenas em `.test-tmp/deps`.
-O log está em `.test-tmp/homologation-tests.log` (artefato local ignorado pelo Git
+O log está em `.test-tmp/diagnostics-tests.log` (artefato local ignorado pelo Git
 e pelo build). Sintaxe Python e `docker compose config --quiet` foram validados,
 tanto para o Compose base quanto com o override GPU, sem iniciar containers.
 A CI foi ajustada para instalar as duas dependências de imagem antes dos testes;
 esse workflow não foi executado remotamente.
+
+Os novos testes cobrem frames vazios/sem ID, baixa confiança versus confirmação
+incompleta, estados antes/depois da ausência, limite, falhas de escrita/callback,
+versão não validada e tracker já registrado, cópia anterior à mutação, caixas
+pós-tracker sem ID e paridade temporal ligada/desligada. O worker com fixtures
+mantém 25 chamadas `track` para 25 frames, decisões e envelopes/evidências iguais,
+inclusive quando falha a escrita do diagnóstico. O teste de stream verifica 100
+chamadas para 100 frames, 99 gaps agregados e um único aviso imediato para uma
+limpeza efetiva. Não executa inferência neural ou ByteTrack real.
+
+Para reproduzir neste Windows com o Python 3.12 disponível, apontar `PYTHONPATH`
+para `.test-tmp/deps` e `TEMP`/`TMP` para `.test-tmp` (diretório gravável do
+workspace), além de `PYTHONUTF8=1`, e executar `python -m unittest discover -s tests -v`.
 
 Pendente no ambiente real: construir/validar a imagem Linux, permissões UID/GID no
 volume da VPS, câmera e pesos reais, FPS/latência sob carga, retenção/espaço e

@@ -89,12 +89,24 @@ class Observer:
         self.skipped = 0
         self.lock = threading.Lock()
         self.period_classes = {}
+        self.period_gaps = 0
+        self.period_max_gap = 0.0
+        self.period_interruptions = 0
         self.operational = {}
         self.samples = {key: deque(maxlen=cfg.metrics_window) for key in ('inference_ms', 'v4_ms', 'pipeline_ms', 'frame_age_ms')}
 
     def captured(self):
         with self.lock:
             self.last_capture = time.monotonic()
+
+    def sampling_gap(self, gap_s):
+        with self.lock:
+            self.period_gaps += 1
+            self.period_max_gap = max(self.period_max_gap, gap_s)
+
+    def continuity_interrupted(self):
+        with self.lock:
+            self.period_interruptions += 1
 
     def completed(self, sequence, inference_s, v4_s, pipeline_s, frame_age_s,
                   detections=(), frame=None, segment=None):
@@ -116,6 +128,9 @@ class Observer:
                 if self.frames % self.cfg.homologation_log_every == 0:
                     payload = dict(self.operational, run_ref=reference(self.run_id), frame=frame or self.frames,
                                    segment=segment, frames=self.frames, capture_skipped=self.skipped,
+                                   sampling_gap_count=self.period_gaps,
+                                   sampling_gap_max_s=self.period_max_gap,
+                                   continuity_interruptions=self.period_interruptions,
                                    detections_by_class=current, interval_detections_by_class=self.period_classes,
                                    track_ids=sorted({d['track_id'] for d in detections if d['track_id'] is not None}),
                                    capture_age_s=None if self.last_capture is None else max(0, now-self.last_capture),
@@ -126,6 +141,8 @@ class Observer:
                                             max=round(max(values), 3) if values else None)
                     log_event(self.log, 'worker.homologation_summary', **payload)
                     self.period_classes = {}
+                    self.period_gaps = self.period_interruptions = 0
+                    self.period_max_gap = 0.0
 
     def flush(self, outbox, force=False):
         now = time.monotonic()

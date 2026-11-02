@@ -32,4 +32,12 @@ A API/n8n permanecem responsáveis por sessão, pausa, destinatários e FCM. A f
 
 Os testes usam fixtures e não acessam câmera, broker, API ou FCM. Os 47 cenários originais estão em `tests/test_reference.py`; `tests/test_boundaries.py` confere proveniência por AST, falhas, logs, saúde e contratos de entrada. A fixture temporal legada serve apenas para regressão histórica e é excluída da imagem. Os guias distinguem implementação testada localmente de homologação real pendente.
 
+Para explicar detecções sem evento, o modo `homologation` oferece auditoria opcional
+em `runs/<run_id>/diagnostico_frames.jsonl`: habilitar
+`HOMOLOGATION_DIAGNOSTICS_ENABLED=true` (padrão `false`), com limite
+`HOMOLOGATION_DIAGNOSTICS_MAX_FRAMES=600`. Inclui frames vazios, caixas sem ID,
+respostas temporais e comparação pós-NMS/saída do tracker da mesma inferência.
+Sampling gaps são agregados ao resumo de 100 frames. Consulte o
+[guia de homologação](docs/HOMOLOGACAO_STREAM.md) para coleta e limites técnicos.
+
 Nenhum peso, vídeo ou segredo real acompanha este pacote. GPU, build Docker e integração real na VPS exigem validação no ambiente alvo. O motor não confirma afogamento nem comprova a meta de oito segundos.

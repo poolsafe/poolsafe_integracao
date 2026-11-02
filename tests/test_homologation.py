@@ -216,8 +216,10 @@ class CaptureTest(unittest.TestCase):
         import main as worker
         from pipeline_fakes import FakeCapture, FakeModelMulti, FakePublisher
         outcomes = []
-        for mode, fail_images in [('production', False), ('development', False),
-                                  ('homologation', False), ('homologation', True)]:
+        for mode, fail_images, diagnostics, fail_audit in [
+                ('production', False, False, False), ('development', False, False, False),
+                ('homologation', False, False, False), ('homologation', True, False, False),
+                ('homologation', False, True, False), ('homologation', False, True, True)]:
             with self.subTest(mode=mode, failure=fail_images), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 (root/'best.pt').write_bytes(b'fixture')
@@ -225,7 +227,8 @@ class CaptureTest(unittest.TestCase):
                 cfg = Config(log_mode=mode, model_path=str(root/'best.pt'), source=str(root/'video.mp4'),
                              data_dir=directory, publish=True, allow_test_publish=True,
                              codigo_integracao='controlled', rabbit_user='fixture', rabbit_password='fixture',
-                             evidence=True, homologation_log_every=10)
+                             evidence=True, homologation_log_every=10,
+                             homologation_diagnostics_enabled=diagnostics)
                 cap = FakeCapture()
                 cap.left = 25
                 original = np.zeros((240, 320, 3), dtype=np.uint8)
@@ -241,9 +244,16 @@ class CaptureTest(unittest.TestCase):
                     if fail_images:
                         raise PermissionError('rtsp://private/credentials')
                     return save(writer, *args)
+                original_open = Path.open
+                def maybe_open(path, *args, **kwargs):
+                    if fail_audit and path.name == 'diagnostico_frames.jsonl':
+                        raise PermissionError('fixture')
+                    return original_open(path, *args, **kwargs)
                 with patch.object(worker, 'Config', return_value=cfg), patch.object(worker, 'Publisher', FakePublisher), \
                      patch.object(cv2, 'VideoCapture', return_value=cap), \
                      patch.object(CaptureWriter, '_save', maybe_save), \
+                     patch.object(Path, 'open', maybe_open), \
+                     patch('diagnostico_frames.version', return_value='8.4.173'), \
                      patch.dict(sys.modules, {'torch': torch, 'ultralytics': SimpleNamespace(YOLO=lambda _: model)}), \
                      self.assertLogs(level=logging.INFO) as logs:
                     worker.main()
@@ -251,6 +261,14 @@ class CaptureTest(unittest.TestCase):
                 self.assertFalse(original.any())
                 run = root/'runs'/(root/'latest_run').read_text()
                 events = [json.loads(line) for line in (run/'eventos.jsonl').read_text().splitlines()]
+                diagnostic_path = run/'diagnostico_frames.jsonl'
+                if diagnostics and not fail_audit:
+                    records = [json.loads(line) for line in diagnostic_path.read_text(encoding='utf-8').splitlines()]
+                    self.assertEqual(len(records), 25)
+                    self.assertTrue(all(r['etapas']['detector_pos_nms'][0]['track_id'] is None for r in records))
+                    self.assertTrue(all(r['etapas']['apos_tracker'][0]['track_id'] == 42 for r in records))
+                else:
+                    self.assertFalse(diagnostic_path.exists())
                 outcomes.append([(e['severity'], e['classe'], e['frame_processado']) for e in events])
                 outbox = Outbox(root/'outbox.sqlite3')
                 for severity in ('ATENCAO', 'CRITICA'):

@@ -22,7 +22,7 @@ Consulte [variáveis, capturas persistentes e coleta](HOMOLOGACAO_STREAM.md).
 | `v4.response` | engine_ms, rows, emitted, transitions, handoffs | Resposta validada; não comprova entrega |
 | `v4.failure` | error_code, error_type, frame, segmento | Falha de entrada/execução/resposta; worker encerra com outbox preservada |
 | `v4.handoff` | frame, transferências | Continuidade pendente aplicada pelo motor |
-| `v4.sampling_gap` | gap_s, frame | Intervalo incomum entre observações live; não altera regras |
+| `v4.sampling_gap` | gap_s, frame | Intervalo incomum entre observações live; em homologation, agregado ao resumo |
 | `risk.event` | event_ref, frame, severidade, event_kind, evidence_count | Emissão local já interpretada |
 | `amqp.publish_confirmed` | event_ref, risk, publish_ms | Broker confirmou; não significa API/app |
 | `amqp.publish_failure` | error_type, pending_preserved | Falha de publicação, sem payload |

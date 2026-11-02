@@ -24,6 +24,7 @@ from engine_adapter import MotorV4, validate_model_classes, ModelCompatibilityEr
 from transporte import Outbox, Publisher
 from observabilidade import JsonFormatter, Observer, log_event, log_risk_event, reference
 from capturas_inspecao import CaptureWriter
+from diagnostico_frames import FrameDiagnostics
 from runtime_support import configure_runtime, synchronize_device
 
 log = logging.getLogger('poolsafe')
@@ -173,6 +174,7 @@ def main():
     local_events_summary = deque(maxlen=1000)
     observer = Observer(c, run_id)
     captures = CaptureWriter(c, run_dir, run_id)
+    diagnostics = FrameDiagnostics(c, run_dir, run_id)
 
     total_proc_time = 0.0
     min_frame_proc_time = None
@@ -194,6 +196,7 @@ def main():
             raise ValueError('MODEL_SHA256 não corresponde aos pesos montados')
         model = YOLO(c.model_path)
         names = validate_model_classes(model.names)
+        diagnostics.install(model, names)
 
         log.info('Execução iniciada run_id=%s log_mode=%s', run_id, c.log_mode)
         log.info('Modelo versão=%s sha256=%s classes=%s device=%s', c.model_version, sha, names, c.device)
@@ -323,6 +326,7 @@ def main():
             frame_number += 1
             process_start = time.monotonic()
             frame_age_s = max(0.0, process_start-captured_mono) if reader else 0.0
+            diagnostic_before = diagnostics.begin(motor)
             synchronize_device(c, torch)
             inference_started = time.perf_counter()
 
@@ -343,8 +347,12 @@ def main():
 
             trace_validation = c.log_mode != 'homologation' and (c.log_mode == 'development' or frame_number % c.v4_log_every == 0)
             if (trace_validation or c.log_mode == 'homologation') and c.source_mode == 'stream' and motor.last_time is not None and logical_time-motor.last_time > c.max_gap:
-                log_event(log, 'v4.sampling_gap', level=logging.WARNING,
-                          gap_s=round(logical_time-motor.last_time, 3), frame=frame_number)
+                gap_s = logical_time-motor.last_time
+                if c.log_mode == 'homologation':
+                    observer.sampling_gap(gap_s)
+                else:
+                    log_event(log, 'v4.sampling_gap', level=logging.WARNING,
+                              gap_s=round(gap_s, 3), frame=frame_number)
             if trace_validation:
                 log_event(log, 'v4.request', run_ref=reference(run_id), frame=frame_number,
                           detections=len(detections), segment=generation)
@@ -361,12 +369,21 @@ def main():
                           emitted=sum(d.status == 'confirmado' for d in decisions),
                           transitions=len(motor.transitions), handoffs=len(motor.continuity))
             if motor.continuity:
-                log_event(log, 'v4.handoff', frame=frame_number, transfers=len(motor.continuity))
+                transfers = sum(t.get('transicao') == 'handoff_evidencia_pendente' for t in motor.continuity)
+                if transfers:
+                    log_event(log, 'v4.handoff', frame=frame_number, transfers=transfers)
                 for transition in motor.continuity:
-                    if transition.get('transicao') == 'interrupcao_lacuna_stream':
+                    if transition.get('transicao') == 'interrupcao_lacuna_stream' and (c.log_mode != 'homologation' or transition['limpeza_efetiva']):
+                        if transition['limpeza_efetiva']:
+                            observer.continuity_interrupted()
                         log_event(log, 'v4.continuity_interrupted', level=logging.WARNING,
                                   frame=frame_number, segment=generation,
                                   gap_s=transition['intervalo_s'], limit_s=transition['limite_s'])
+            diagnostics.write(motor=motor, before=diagnostic_before, detections=detections,
+                              decisions=decisions, segment=generation, processed_frame=frame_number,
+                              captured_frame=capture_sequence, observed_at=observed,
+                              logical_time=logical_time, source_mode=c.source_mode,
+                              inference_conf=c.inference_conf, iou=c.iou)
             frame_proc_time = time.monotonic() - process_start
 
             # Agregação de latências sem manter medições infinitas em memória
@@ -566,6 +583,8 @@ def main():
                 'include_evidence': c.evidence,
                 'max_pending_events': c.max_pending,
                 'homologation_log_every_n_frames': c.homologation_log_every,
+                'homologation_diagnostics_enabled': c.homologation_diagnostics_enabled,
+                'homologation_diagnostics_max_frames': c.homologation_diagnostics_max_frames,
                 'captures_enabled': c.captures_enabled,
                 'captures_interval_s': c.captures_interval,
                 'captures_max_count': c.captures_max_count,
@@ -574,6 +593,7 @@ def main():
             'capturas': {'quantidade': captures.count, 'bytes': captures.bytes,
                          'suspensas_por_limite': captures.suspended,
                          'avisos': sorted(captures.warned), 'indice': 'capturas/indice.jsonl'},
+            'diagnostico': diagnostics.summary(),
             'modelo': {
                 'versao': c.model_version,
                 'sha256': sha,

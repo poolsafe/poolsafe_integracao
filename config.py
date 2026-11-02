@@ -51,6 +51,8 @@ class Config:
     desequilibrio_class: str = os.getenv('DESEQUILIBRIO_CLASS', 'pessoa_desequilibrio')
     log_mode: str = os.getenv('LOG_MODE', 'production').lower()
     homologation_log_every: int = int(os.getenv('HOMOLOGATION_LOG_EVERY_N_FRAMES', '100'))
+    homologation_diagnostics_enabled: bool = flag('HOMOLOGATION_DIAGNOSTICS_ENABLED')
+    homologation_diagnostics_max_frames: int = int(os.getenv('HOMOLOGATION_DIAGNOSTICS_MAX_FRAMES', '600'))
     captures_enabled: bool = flag('CAPTURES_ENABLED') if os.getenv('CAPTURES_ENABLED', '') else None
     captures_interval: float = float(os.getenv('CAPTURES_INTERVAL_S', '1'))
     captures_max_count: int = int(os.getenv('CAPTURES_MAX_COUNT', '1000'))
@@ -115,7 +117,7 @@ class Config:
                 raise ValueError('Intervalos de execução inválidos')
         if self.log_mode not in {'development', 'production', 'homologation'}:
             raise ValueError('LOG_MODE deve ser development, production ou homologation')
-        if min(self.homologation_log_every, self.captures_max_count, self.captures_max_bytes) < 1:
+        if min(self.homologation_log_every, self.homologation_diagnostics_max_frames, self.captures_max_count, self.captures_max_bytes) < 1:
             raise ValueError('Limites de observabilidade devem ser positivos')
         if not math.isfinite(self.captures_interval) or self.captures_interval <= 0:
             raise ValueError('CAPTURES_INTERVAL_S deve ser positivo e finito')

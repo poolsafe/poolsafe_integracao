@@ -26,6 +26,10 @@ class FakeModelMulti:
         self.names = {0: 'pessoa_desequilibrio', 1: 'pessoa_normal', 2: 'pessoa_queda'}
         self.sequence_classes = sequence_classes or [0]
         self.call_count = 0
+        self.callbacks = {'on_predict_postprocess_end': []}
+
+    def add_callback(self, event, callback):
+        self.callbacks[event].append(callback)
 
     def track(self, *a, **kw):
         idx = min(self.call_count, len(self.sequence_classes) - 1)
@@ -38,7 +42,13 @@ class FakeModelMulti:
             id = Tensor([42])
             def __len__(self):
                 return 1
-        return [SimpleNamespace(boxes=DynamicBoxes())]
+        boxes = DynamicBoxes()
+        boxes.id = None
+        predictor = SimpleNamespace(results=[SimpleNamespace(boxes=boxes)])
+        for callback in self.callbacks['on_predict_postprocess_end']:
+            callback(predictor)
+        boxes.id = Tensor([42])
+        return predictor.results
 
 class FakeCapture:
     def __init__(self):

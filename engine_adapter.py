@@ -180,6 +180,9 @@ class MotorV4:
         try:
             # now é monotônico em stream; vídeo mantém seu tempo nominal.
             if self.stream_mode and self.last_time is not None and now-self.last_time > self.continuity_gap:
+                cleared_ids = sorted({tid for tid, st in self.engine.states.items()
+                                      if any(st['counts'].values()) or st['normal']}
+                                     | {tid for tid, hist in self.engine.evidencias_queda.items() if hist})
                 for st in self.engine.states.values():
                     self.engine.clear_risk(st)
                     st['normal'] = 0
@@ -191,7 +194,8 @@ class MotorV4:
                 self.engine.auditoria_continuidade.append(dict(
                     frame=frame_number, tempo_video_s=now,
                     transicao='interrupcao_lacuna_stream', intervalo_s=now-self.last_time,
-                    limite_s=self.continuity_gap))
+                    limite_s=self.continuity_gap, ids_com_evidencias_limpas=cleared_ids,
+                    limpeza_efetiva=bool(cleared_ids)))
             rows = self.engine.step(frame_number, now, raw)
             events = list(self.engine.events)
             self._validate_response(rows, events, frame_number, raw)
