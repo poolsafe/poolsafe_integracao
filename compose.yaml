@@ -17,7 +17,7 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "python", "healthcheck.py"]
+      test: [ "CMD", "python", "healthcheck.py" ]
       interval: 30s
       timeout: 5s
       start_period: 60s
@@ -54,6 +54,7 @@ services:
       TORCH_THREADS: ${TORCH_THREADS:-2}
       TORCH_INTEROP_THREADS: ${TORCH_INTEROP_THREADS:-1}
       OPENCV_THREADS: ${OPENCV_THREADS:-1}
+      OPENCV_FFMPEG_CAPTURE_OPTIONS: ${OPENCV_FFMPEG_CAPTURE_OPTIONS:-}
       METRICS_WINDOW: ${METRICS_WINDOW:-1024}
       METRICS_INTERVAL_S: ${METRICS_INTERVAL_S:-15}
       HEALTH_STALE_S: ${HEALTH_STALE_S:-90}
